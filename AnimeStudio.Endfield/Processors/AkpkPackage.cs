@@ -264,6 +264,8 @@ public sealed class AkpkPackage
     {
         int start = (int)entry.Offset;
         int end = start + (int)entry.Size;
+        if (start < 0 || end > _data.Length)
+            throw new InvalidDataException($"WEM 越界: offset={start}, size={entry.Size}, data 长度={_data.Length}");
         var data = new byte[entry.Size];
         Array.Copy(_data, start, data, 0, data.Length);
 
@@ -279,12 +281,16 @@ public sealed class AkpkPackage
 
     private static uint ReadU32LE(byte[] data, int offset)
     {
+        if ((uint)offset + 4 > (uint)data.Length)
+            throw new InvalidDataException($"读取越界: offset={offset}, 需要 4 字节, 剩余 {data.Length - offset}");
         return (uint)(data[offset] | (data[offset + 1] << 8) |
                       (data[offset + 2] << 16) | (data[offset + 3] << 24));
     }
 
     private static ulong ReadU64LE(byte[] data, int offset)
     {
+        if ((uint)offset + 8 > (uint)data.Length)
+            throw new InvalidDataException($"读取越界: offset={offset}, 需要 8 字节, 剩余 {data.Length - offset}");
         return (ulong)ReadU32LE(data, offset) | ((ulong)ReadU32LE(data, offset + 4) << 32);
     }
 

@@ -7,6 +7,7 @@ using SixLabors.ImageSharp.Formats.Bmp;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Tga;
 using SixLabors.ImageSharp.PixelFormats;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime;
 using System.Text.RegularExpressions;
@@ -505,7 +506,10 @@ internal static class Program
                 if (audioDialogJson != null) break;
             }
         }
-        catch (DirectoryNotFoundException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Warning: failed to load AudioDialog table: {ex.Message}");
+        }
 
         if (audioDialogJson == null)
         {
@@ -592,7 +596,9 @@ internal static class Program
                             }
 
                             // 校验 RIFF/RIFX 头
-                            if (wemData[0] != (byte)'R' || (wemData[3] != (byte)'F'))
+                            if (wemData[0] != (byte)'R' || wemData[1] != (byte)'I' ||
+                                wemData[2] != (byte)'F' ||
+                                (wemData[3] != (byte)'F' && wemData[3] != (byte)'X'))
                             {
                                 Interlocked.Increment(ref localErrors);
                                 return;
@@ -1008,6 +1014,9 @@ internal static class Program
         long totalBytes = 0;
         int stage1Extracted = 0;
 
+        // 跨 batch 的文件名占位表，防止重名纹理互相覆盖
+        var claimedNames = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+
         // ── Progress task (global) ──
         bool progressEnabled = !Console.IsErrorRedirected;
         var progressCts = new CancellationTokenSource();
@@ -1154,12 +1163,19 @@ internal static class Program
                                                 ? Path.Combine(outPath, ClassifyImage(name))
                                                 : outPath;
 
+                                            // 原子占位：先到先得，重名自动加 PathID 后缀
                                             string outFile = Path.Combine(targetDir, safeName + ext);
-
-                                            if (File.Exists(outFile))
+                                            if (!claimedNames.TryAdd(outFile, 0))
                                             {
                                                 outFile = Path.Combine(targetDir,
                                                     $"{safeName}_{tex.m_PathID:x}{ext}");
+                                                int dup = 2;
+                                                while (!claimedNames.TryAdd(outFile, 0))
+                                                {
+                                                    outFile = Path.Combine(targetDir,
+                                                        $"{safeName}_{tex.m_PathID:x}_{dup}{ext}");
+                                                    dup++;
+                                                }
                                             }
 
                                             string? targetParent = Path.GetDirectoryName(outFile);

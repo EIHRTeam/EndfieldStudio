@@ -150,17 +150,19 @@ public static class SparkBuffer
             int ePos = s.IndexOf('E');
             if (ePos >= 0)
             {
-                // 转换 E+07 → e+7, E-07 → e-7
                 string mantissa = s[..ePos];
                 string exp = s[(ePos + 1)..];
-                // 去掉指数前导零："-07" → "-7", "+07" → "+7" → "7"
-                if (exp.Length > 1 && exp[0] == '+' && exp[1] == '0')
-                    exp = exp[1..].TrimStart('0');
-                else if (exp.Length > 2 && (exp[0] == '-' || exp[0] == '+') && exp[1] == '0')
-                    exp = exp[0] + exp[1..].TrimStart('0');
-                // ryu 格式正指数不带 +
-                if (exp.StartsWith('+')) exp = exp[1..];
-                sb.Append(mantissa).Append('e').Append(exp);
+                // 解析指数符号和数值
+                bool negative = exp.Length > 0 && exp[0] == '-';
+                if (exp.Length > 0 && (exp[0] == '+' || exp[0] == '-'))
+                    exp = exp[1..];
+                // 去掉前导零
+                exp = exp.TrimStart('0');
+                if (exp.Length == 0) exp = "0";
+                // ryu 格式：正指数不带 +，负指数带 -
+                sb.Append(mantissa).Append('e');
+                if (negative) sb.Append('-');
+                sb.Append(exp);
             }
             else
             {
@@ -203,6 +205,8 @@ public static class SparkBuffer
     private static void ParseTypeDefinitions(SparkReader br, TypeRegistry registry)
     {
         int typeDefCount = br.ReadInt32LE();
+        if (typeDefCount < 0 || typeDefCount > 100_000)
+            throw new SparkBufferException($"类型定义数量异常: {typeDefCount}");
 
         for (int i = 0; i < typeDefCount; i++)
         {
@@ -217,6 +221,8 @@ public static class SparkBuffer
                     string name = br.ReadNullTerminatedString();
                     br.Align4();
                     int itemCount = br.ReadInt32LE();
+                    if (itemCount < 0 || itemCount > 1_000_000)
+                        throw new SparkBufferException($"Enum itemCount 异常: {itemCount}");
 
                     var items = new List<EnumItem>(itemCount);
                     for (int j = 0; j < itemCount; j++)
@@ -236,6 +242,8 @@ public static class SparkBuffer
                     string name = br.ReadNullTerminatedString();
                     br.Align4();
                     int fieldCount = br.ReadInt32LE();
+                    if (fieldCount < 0 || fieldCount > 10_000)
+                        throw new SparkBufferException($"Bean fieldCount 异常: {fieldCount}");
 
                     var fields = new List<BeanField>(fieldCount);
                     for (int j = 0; j < fieldCount; j++)
@@ -407,6 +415,8 @@ public static class SparkBuffer
     private static List<object?> ReadArrayValue(SparkReader br, BeanField field, TypeRegistry registry)
     {
         int itemCount = br.ReadInt32LE();
+        if (itemCount < 0 || itemCount > 10_000_000)
+            throw new SparkBufferException($"Array itemCount 异常: {itemCount}");
         var arr = new List<object?>(itemCount);
 
         var itemType = field.Type2
@@ -450,6 +460,8 @@ public static class SparkBuffer
         SparkReader br, RootDef rootDef, TypeRegistry registry)
     {
         int kvCount = br.ReadInt32LE();
+        if (kvCount < 0 || kvCount > 10_000_000)
+            throw new SparkBufferException($"root map kvCount 异常: {kvCount}");
         br.BaseStream.Seek((long)kvCount * 8, SeekOrigin.Current);
 
         var keyType = rootDef.Type2 ?? throw new SparkBufferException("root map 缺少 type2");
@@ -466,6 +478,8 @@ public static class SparkBuffer
         TypeRegistry registry)
     {
         int kvCount = br.ReadInt32LE();
+        if (kvCount < 0 || kvCount > 10_000_000)
+            throw new SparkBufferException($"map kvCount 异常: {kvCount}");
         br.BaseStream.Seek((long)kvCount * 8, SeekOrigin.Current);
 
         var keyType = keyTypeOpt ?? throw new SparkBufferException("map 缺少 type2");
@@ -665,10 +679,13 @@ internal sealed class SparkReader : IDisposable
 
     public SparkType ReadSparkType() => SparkTypeExtensions.FromByte(_br.ReadByte());
 
-    public string ReadNullTerminatedString()
+    /// <summary>
+    /// 从流读取 null 终止字符串。限制最大长度防止损坏数据导致无限读取。
+    /// </summary>
+    public string ReadNullTerminatedString(int maxLen = 1 << 20)
     {
         var bytes = new List<byte>(32);
-        while (true)
+        while (bytes.Count < maxLen)
         {
             int b = _br.ReadByte();
             if (b == 0) break;
