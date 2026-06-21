@@ -27,6 +27,11 @@ internal static class Program
                                 [--block <type>...] [--threads N] [--scratch <dir>] [--keep-bundles]
                                 [--format png|bmp|tga] [--png-compression none|fast|default]
                                 [--max-memory-gb N] [--no-chunk-batching]
+                                [--exclude-material] [--classify]
+          endfield-dump audio   --vfs <streaming_assets_path> --out <dir>
+                                [--language all|chinese|english|japanese|korean]
+                                [--format wem|wav] [--block all|audio|initialaudio|auditaudio|voice]
+                                [--vgmstream <path>] [--threads N]
 
         Block types (case-insensitive). If omitted, all dumpable types are processed.
           InitialAudio, InitialBundle, InitialExtendData, BundleManifest, IFixPatch,
@@ -61,6 +66,7 @@ internal static class Program
                 "list" => RunList(args.AsSpan(1)),
                 "inspect" => RunInspect(args.AsSpan(1)),
                 "extract" => await RunExtract(args[1..]),
+                "audio" => RunAudio(args.AsSpan(1)),
                 "--help" or "-h" or "help" => PrintHelpAndExit(),
                 _ => UnknownCommand(command),
             };
@@ -273,6 +279,17 @@ internal static class Program
                         byte[] processed = LuaProcessor.DecryptAndNormalize(data);
                         File.WriteAllBytes(outPath, processed);
                     }
+                    else if (bt == BlockType.Table)
+                    {
+                        // Table 文件 = SparkBuffer 二进制格式，需解析成 JSON
+                        // 输出文件名用 SparkBuffer 内 rootDef.name（非 VFS 文件名）
+                        byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
+                        var (rootName, json) = SparkBuffer.Parse(data);
+                        string tableOutDir = Path.Combine(outRoot, "Table");
+                        Directory.CreateDirectory(tableOutDir);
+                        outPath = Path.Combine(tableOutDir, rootName + ".json");
+                        File.WriteAllText(outPath, json);
+                    }
                     else
                     {
                         // 其他类型直接流式：ChaCha20 解密 → 直接写盘，零拷贝中间态
@@ -315,6 +332,388 @@ internal static class Program
             return Path.Combine(outRoot, "Lua", outName);
         }
         return Path.Combine(outRoot, fileName);
+    }
+
+    // ── audio 子命令 ──────────────────────────────────────────────
+
+    private sealed class AudioArgs
+    {
+        public string? VfsPath;
+        public string? OutPath;
+        public List<AudioMap.Language> Languages = new();
+        public string Format = "wem";  // wem | wav
+        public List<BlockType> Blocks = new();
+        public string? VgmstreamPath;
+        public int Threads;
+    }
+
+    private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice }
+
+    private static int RunAudio(ReadOnlySpan<string> args)
+    {
+        var parsed = new AudioArgs();
+        var langStr = "all";
+        var blockStr = "all";
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            switch (a)
+            {
+                case "--vfs":
+                case "-s":
+                    parsed.VfsPath = RequireValue(args, ref i, a);
+                    break;
+                case "--out":
+                case "-o":
+                    parsed.OutPath = RequireValue(args, ref i, a);
+                    break;
+                case "--language":
+                case "-l":
+                    langStr = RequireValue(args, ref i, a);
+                    break;
+                case "--format":
+                case "-f":
+                    parsed.Format = RequireValue(args, ref i, a).ToLowerInvariant();
+                    break;
+                case "--block":
+                case "-b":
+                    blockStr = RequireValue(args, ref i, a);
+                    break;
+                case "--vgmstream":
+                    parsed.VgmstreamPath = RequireValue(args, ref i, a);
+                    break;
+                case "--threads":
+                case "-t":
+                    parsed.Threads = int.Parse(RequireValue(args, ref i, a));
+                    break;
+                default:
+                    throw new ArgumentException($"Unknown argument: {a}");
+            }
+        }
+
+        if (parsed.VfsPath is null) throw new ArgumentException("--vfs is required");
+        if (parsed.OutPath is null) throw new ArgumentException("--out is required");
+        if (parsed.Format is not ("wem" or "wav"))
+            throw new ArgumentException($"--format must be wem or wav, got: {parsed.Format}");
+
+        // 语言
+        parsed.Languages = langStr.ToLowerInvariant() switch
+        {
+            "all" => AudioMap.AllLanguages().ToList(),
+            "chinese" or "cn" => new() { AudioMap.Language.Chinese },
+            "english" or "en" => new() { AudioMap.Language.English },
+            "japanese" or "jp" => new() { AudioMap.Language.Japanese },
+            "korean" or "kr" => new() { AudioMap.Language.Korean },
+            _ => throw new ArgumentException($"Unknown language: {langStr}"),
+        };
+
+        // block group → 具体 BlockType 列表
+        var group = blockStr.ToLowerInvariant() switch
+        {
+            "all" => AudioBlockGroup.All,
+            "audio" => AudioBlockGroup.Audio,
+            "initialaudio" or "initaudio" => AudioBlockGroup.InitialAudio,
+            "auditaudio" => AudioBlockGroup.AuditAudio,
+            "voice" => AudioBlockGroup.Voice,
+            _ => throw new ArgumentException($"Unknown audio block group: {blockStr}"),
+        };
+
+        parsed.Blocks = ResolveAudioBlocks(group, parsed.Languages);
+
+        Directory.CreateDirectory(parsed.OutPath);
+        RunAudioPipeline(parsed);
+        return 0;
+    }
+
+    private static List<BlockType> ResolveAudioBlocks(AudioBlockGroup group, List<AudioMap.Language> languages)
+    {
+        var blocks = new List<BlockType>();
+        if (group is AudioBlockGroup.All or AudioBlockGroup.Audio)
+            blocks.Add(BlockType.Audio);
+        if (group is AudioBlockGroup.All or AudioBlockGroup.InitialAudio)
+            blocks.Add(BlockType.InitialAudio);
+        if (group is AudioBlockGroup.All or AudioBlockGroup.AuditAudio)
+            blocks.Add(BlockType.AuditAudio);
+        if (group is AudioBlockGroup.All or AudioBlockGroup.Voice)
+        {
+            foreach (var lang in languages)
+            {
+                blocks.Add(lang switch
+                {
+                    AudioMap.Language.Chinese => BlockType.AudioChinese,
+                    AudioMap.Language.English => BlockType.AudioEnglish,
+                    AudioMap.Language.Japanese => BlockType.AudioJapanese,
+                    AudioMap.Language.Korean => BlockType.AudioKorean,
+                    _ => BlockType.AudioChinese,
+                });
+            }
+        }
+        return blocks;
+    }
+
+    private static void RunAudioPipeline(AudioArgs parsed)
+    {
+        var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key);
+        bool wantWav = parsed.Format == "wav";
+
+        // vgmstream 可选（wav 模式才需要）
+        string? vgmstream = wantWav ? parsed.VgmstreamPath : null;
+        if (wantWav && string.IsNullOrEmpty(vgmstream))
+        {
+            // 自动探测 fluffy-dumper 目录下的 vgmstream-cli
+            var candidates = new[]
+            {
+                Path.Combine(parsed.VfsPath!, "..", "..", "fluffy-dumper", "vgmstream", "bin", "linux", "vgmstream-cli"),
+                "/usr/local/bin/vgmstream-cli",
+                "vgmstream-cli",
+            };
+            foreach (var c in candidates)
+            {
+                if (File.Exists(c))
+                {
+                    vgmstream = c;
+                    Console.WriteLine($"  Found vgmstream-cli: {c}");
+                    break;
+                }
+            }
+            if (string.IsNullOrEmpty(vgmstream))
+            {
+                Console.WriteLine("  Warning: vgmstream-cli not found, falling back to .wem output.");
+                wantWav = false;
+            }
+        }
+
+        // 1. 加载 AudioDialog 表（从 Table block）
+        Console.WriteLine("Loading AudioDialog table...");
+        string? audioDialogJson = null;
+        try
+        {
+            var tableInfo = loader.LoadBlockInfo(BlockType.Table);
+            foreach (var chunk in tableInfo.Chunks)
+            {
+                foreach (var file in chunk.Files)
+                {
+                    var data = loader.ExtractFileToBytes(BlockType.Table, chunk, file);
+                    var (rootName, json) = SparkBuffer.Parse(data);
+                    if (rootName == "AudioDialog")
+                    {
+                        audioDialogJson = json;
+                        break;
+                    }
+                }
+                if (audioDialogJson != null) break;
+            }
+        }
+        catch (DirectoryNotFoundException) { }
+
+        if (audioDialogJson == null)
+        {
+            Console.WriteLine("  Warning: AudioDialog table not found, all WEMs will be unmapped.");
+        }
+
+        int totalSuccess = 0;
+        int totalErrors = 0;
+        int totalUnmapped = 0;
+
+        foreach (var lang in parsed.Languages)
+        {
+            Console.WriteLine($"\nProcessing {AudioMap.LanguageName(lang)} audio...");
+
+            var audioMap = audioDialogJson != null
+                ? AudioMap.FromAudioDialog(audioDialogJson, lang)
+                : new AudioMap();
+
+            if (audioMap.Count > 0)
+                Console.WriteLine($"  Found {audioMap.Count} audio entries");
+
+            foreach (var bt in parsed.Blocks)
+            {
+                Console.WriteLine($"  Extracting {AudioMap.LanguageName(lang)} from {bt.Name()}...");
+
+                List<(string Name, byte[] Data)> pckFiles;
+                try
+                {
+                    pckFiles = ExtractPckFiles(loader, bt);
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    Console.WriteLine($"    Skip: no PCK files found in {bt.Name()}");
+                    continue;
+                }
+
+                if (pckFiles.Count == 0)
+                {
+                    Console.WriteLine($"    Skip: no PCK files found");
+                    continue;
+                }
+
+                Console.WriteLine($"    Found {pckFiles.Count} PCK files");
+
+                var opts = new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = parsed.Threads > 0 ? parsed.Threads : Environment.ProcessorCount,
+                };
+
+                int success = 0;
+                int errors = 0;
+                int unmapped = 0;
+
+                foreach (var (pckName, pckData) in pckFiles)
+                {
+                    Console.WriteLine($"    Processing {pckName}");
+
+                    AkpkPackage package;
+                    try
+                    {
+                        package = AkpkPackage.Parse(pckData);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"      Error: failed to parse {pckName}: {ex.Message}");
+                        errors++;
+                        continue;
+                    }
+
+                    var entries = package.Entries;
+                    int localSuccess = 0;
+                    int localErrors = 0;
+                    int localUnmapped = 0;
+
+                    Parallel.ForEach(entries, opts, entry =>
+                    {
+                        try
+                        {
+                            byte[] wemData = package.GetWemData(entry);
+                            if (wemData.Length < 4)
+                            {
+                                Interlocked.Increment(ref localErrors);
+                                return;
+                            }
+
+                            // 校验 RIFF/RIFX 头
+                            if (wemData[0] != (byte)'R' || (wemData[3] != (byte)'F'))
+                            {
+                                Interlocked.Increment(ref localErrors);
+                                return;
+                            }
+
+                            string hash = $"{entry.Id:x}";
+                            string outPath;
+
+                            if (audioMap.GetPath(hash) is string mappedPath)
+                            {
+                                string ext = wantWav ? ".wav" : ".wem";
+                                string pathWithExt = mappedPath.Replace(".wem", ext, StringComparison.OrdinalIgnoreCase);
+                                if (wantWav && !pathWithExt.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
+                                    pathWithExt = Path.ChangeExtension(pathWithExt, ".wav");
+                                outPath = Path.Combine(parsed.OutPath!, pathWithExt);
+                            }
+                            else
+                            {
+                                Interlocked.Increment(ref localUnmapped);
+                                string ext = wantWav ? ".wav" : ".wem";
+                                string filename = $"{entry.Id}{ext}";
+                                outPath = Path.Combine(
+                                    parsed.OutPath!,
+                                    "unmapped",
+                                    AudioMap.LanguageToLower(lang),
+                                    filename);
+                            }
+
+                            string? dir = Path.GetDirectoryName(outPath);
+                            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                            if (wantWav && vgmstream != null)
+                            {
+                                WriteWavViaVgmstream(wemData, outPath, vgmstream);
+                            }
+                            else
+                            {
+                                File.WriteAllBytes(outPath, wemData);
+                            }
+
+                            Interlocked.Increment(ref localSuccess);
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.Increment(ref localErrors);
+                            Console.Error.WriteLine($"      Error: failed to write {entry.Id}: {ex.Message}");
+                        }
+                    });
+
+                    success += localSuccess;
+                    errors += localErrors;
+                    unmapped += localUnmapped;
+                }
+
+                Console.WriteLine($"    Done: processed {success} entries ({unmapped} unmapped, {errors} errors)");
+                Interlocked.Add(ref totalSuccess, success);
+                Interlocked.Add(ref totalErrors, errors);
+                Interlocked.Add(ref totalUnmapped, unmapped);
+            }
+        }
+
+        Console.WriteLine($"\nComplete: extracted {totalSuccess} files ({totalUnmapped} unmapped, {totalErrors} errors)");
+    }
+
+    private static List<(string Name, byte[] Data)> ExtractPckFiles(VfsLoader loader, BlockType bt)
+    {
+        var result = new List<(string, byte[])>();
+        var info = loader.LoadBlockInfo(bt);
+
+        foreach (var chunk in info.Chunks)
+        {
+            foreach (var file in chunk.Files)
+            {
+                if (file.FileName.EndsWith(".pck", StringComparison.OrdinalIgnoreCase))
+                {
+                    byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
+                    result.Add((file.FileName, data));
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static void WriteWavViaVgmstream(byte[] wemData, string outPath, string vgmstreamCli)
+    {
+        string? dir = Path.GetDirectoryName(outPath);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        // 写临时 .wem 文件
+        string tempWem = outPath + ".tmp.wem";
+        File.WriteAllBytes(tempWem, wemData);
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = vgmstreamCli,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-o");
+            psi.ArgumentList.Add(outPath);
+            psi.ArgumentList.Add(tempWem);
+
+            using var proc = Process.Start(psi)!;
+            string stderr = proc.StandardError.ReadToEnd();
+            proc.WaitForExit();
+            if (proc.ExitCode != 0)
+            {
+                throw new InvalidOperationException($"vgmstream exit {proc.ExitCode}: {stderr}");
+            }
+        }
+        finally
+        {
+            if (File.Exists(tempWem))
+            {
+                try { File.Delete(tempWem); } catch { }
+            }
+        }
     }
 
     /// <summary>
@@ -469,6 +868,8 @@ internal static class Program
         string pngCompression = "none"; // none | fast | default
         int maxMemoryGb = 64;           // 内存预算上限（GB）
         bool noChunkBatching = false;   // 默认按 chunk 分批
+        bool excludeMaterial = false;   // 排除材质贴图（T_ 前缀的 PBR 槽位贴图）
+        bool classify = false;          // 按类型分目录输出
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -491,6 +892,8 @@ internal static class Program
                 case "--png-compression": pngCompression = RequireValue(args, ref i, a).ToLowerInvariant(); break;
                 case "--max-memory-gb": maxMemoryGb = int.Parse(RequireValue(args, ref i, a)); break;
                 case "--no-chunk-batching": noChunkBatching = true; break;
+                case "--exclude-material": excludeMaterial = true; break;
+                case "--classify": classify = true; break;
                 default: throw new ArgumentException($"Unknown argument: {a}");
             }
         }
@@ -601,6 +1004,7 @@ internal static class Program
         // ── Global counters (persist across batches) ──
         long pngWritten = 0, bundlesProcessed = 0, bundlesFailed = 0;
         long objectsScanned = 0, texturesMatched = 0, texturesDecodeFailed = 0;
+        long materialSkipped = 0;
         long totalBytes = 0;
         int stage1Extracted = 0;
 
@@ -723,6 +1127,13 @@ internal static class Program
                                         string name = tex.m_Name ?? "";
                                         if (assetRx != null && !assetRx.IsMatch(name)) continue;
 
+                                        // 排除材质贴图（T_ 前缀的 PBR 槽位贴图）
+                                        if (excludeMaterial && IsMaterialTexture(name))
+                                        {
+                                            Interlocked.Increment(ref materialSkipped);
+                                            continue;
+                                        }
+
                                         Interlocked.Increment(ref texturesMatched);
 
                                         try
@@ -737,13 +1148,23 @@ internal static class Program
                                             string safeName = string.IsNullOrEmpty(name)
                                                 ? $"texture_{tex.m_PathID}"
                                                 : SanitizeFileName(name);
-                                            string outFile = Path.Combine(outPath, safeName + ext);
+
+                                            // 按类型分目录
+                                            string targetDir = classify
+                                                ? Path.Combine(outPath, ClassifyImage(name))
+                                                : outPath;
+
+                                            string outFile = Path.Combine(targetDir, safeName + ext);
 
                                             if (File.Exists(outFile))
                                             {
-                                                outFile = Path.Combine(outPath,
+                                                outFile = Path.Combine(targetDir,
                                                     $"{safeName}_{tex.m_PathID:x}{ext}");
                                             }
+
+                                            string? targetParent = Path.GetDirectoryName(outFile);
+                                            if (!string.IsNullOrEmpty(targetParent))
+                                                Directory.CreateDirectory(targetParent);
 
                                             using var fs = new FileStream(outFile, FileMode.Create,
                                                 FileAccess.Write, FileShare.None, 64 * 1024,
@@ -818,6 +1239,11 @@ internal static class Program
             $"  objects scanned         = {objectsScanned:#,0}");
         Console.WriteLine(
             $"  Texture2D matched       = {texturesMatched:#,0}");
+        if (excludeMaterial)
+        {
+            Console.WriteLine(
+            $"  material textures skip  = {materialSkipped:#,0}");
+        }
         Console.WriteLine(
             $"  images written          = {pngWritten:#,0}  ({outPath})");
         Console.WriteLine(
@@ -840,6 +1266,91 @@ internal static class Program
             buf[i] = Array.IndexOf(InvalidFileNameChars, c) >= 0 ? '_' : c;
         }
         return new string(buf);
+    }
+
+    /// <summary>
+    /// 判断是否为非可视的引擎数据贴图（材质 PBR 槽位 + 地形/高度图/遮罩）。
+    /// 这些是引擎运行时使用的数据纹理，不是给人看的图片。
+    /// </summary>
+    private static bool IsMaterialTexture(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+
+        // T_ 前缀 = Unity 材质贴图约定（T_model_D/N/E/P/M/AO/BC/S/Mask 等）
+        if (name.Length > 2 && (name[0] == 'T' || name[0] == 't') && name[1] == '_')
+            return true;
+
+        // Terrain 前缀 = 地形引擎数据（splat/height/index map，71k+ 文件）
+        if (name.StartsWith("Terrain", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var lower = name.ToLowerInvariant();
+        var lowerSpan = lower.AsSpan();
+
+        // h_ / m_ / l_ 前缀 = heightmap / metallic / LOD 数据图
+        if (lower.Length >= 2 && lower[1] == '_' && (lower[0] == 'h' || lower[0] == 'm' || lower[0] == 'l'))
+            return true;
+
+        // LAYER 前缀 = 图层遮罩
+        if (lower.StartsWith("layer"))
+            return true;
+
+        // mask_ 前缀 = 遮罩图
+        if (lower.StartsWith("mask_") || lower.StartsWith("mask"))
+            return true;
+
+        // SplatIndexMap / etchlist 等地形辅助数据
+        if (lower.StartsWith("splatindexmap") || lower.StartsWith("etchlist"))
+            return true;
+
+        // 无 T_ 前缀但带明确材质槽位全名
+        return lowerSpan.EndsWith("_BaseMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_BumpMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_NormalMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_EmissionMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_MetallicGlossMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_MaskMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_OcclusionMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_DetailMap", StringComparison.OrdinalIgnoreCase)
+            || lowerSpan.EndsWith("_SpecGlossMap", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 按图片命名前缀分类到子目录。
+    /// 基于 Endfield 实际命名规则：pic_ = 立绘, icon_ = 图标, item_ = 道具, 等。
+    /// </summary>
+    private static string ClassifyImage(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return "other";
+        var lower = name.ToLowerInvariant();
+
+        if (lower.StartsWith("pic_")) return "character";
+        if (lower.StartsWith("icon_round")) return "icon_round";
+        if (lower.StartsWith("icon_")) return "icon";
+        if (lower.StartsWith("item_topic")) return "item_topic";
+        if (lower.StartsWith("item_potential")) return "item_potential";
+        if (lower.StartsWith("item_")) return "item";
+        if (lower.StartsWith("business_card")) return "business_card";
+        if (lower.StartsWith("sns_")) return "sns";
+        if (lower.StartsWith("bg_") || lower.StartsWith("background") || lower.StartsWith("activity_bg")) return "background";
+        if (lower.StartsWith("logo")) return "logo";
+        if (lower.StartsWith("loading")) return "loading";
+        if (lower.StartsWith("tutorial")) return "tutorial";
+        if (lower.StartsWith("cg_")) return "cg";
+        if (lower.StartsWith("splash")) return "splash";
+        if (lower.StartsWith("chr_")) return "chr_thumb";
+        if (lower.StartsWith("title")) return "title";
+        if (lower.StartsWith("tips")) return "tips";
+        if (lower.StartsWith("achv_")) return "achievement";
+        if (lower.StartsWith("wpn_")) return "weapon";
+        if (lower.StartsWith("activity_")) return "activity";
+        if (lower.StartsWith("prts_")) return "prts";
+        if (lower.StartsWith("dung")) return "dungeon";
+        if (lower.StartsWith("dlg_")) return "dialog";
+        if (lower.StartsWith("gacha")) return "gacha";
+        if (lower.StartsWith("image_")) return "image";
+
+        return "other";
     }
 
     /// <summary>
