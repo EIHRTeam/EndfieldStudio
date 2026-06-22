@@ -9,7 +9,9 @@ using SixLabors.ImageSharp.Formats.Tga;
 using SixLabors.ImageSharp.PixelFormats;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
 
@@ -35,6 +37,9 @@ internal static class Program
                                 [--vgmstream <path>] [--ffmpeg <path>]
                                 [--mp3-bitrate 192] [--mp3-quality best|high|medium|low|minimum|0-9]
                                 [--threads N]
+          endfield-dump video   --vfs <streaming_assets_path> --out <dir>
+                                [--format mp4|usm] [--block all|video|auditvideo]
+                                [--ffmpeg <path>] [--threads N]
 
         Block types (case-insensitive). If omitted, all dumpable types are processed.
           InitialAudio, InitialBundle, InitialExtendData, BundleManifest, IFixPatch,
@@ -70,6 +75,7 @@ internal static class Program
                 "inspect" => RunInspect(args.AsSpan(1)),
                 "extract" => await RunExtract(args[1..]),
                 "audio" => RunAudio(args.AsSpan(1)),
+                "video" => RunVideo(args.AsSpan(1)),
                 "--help" or "-h" or "help" => PrintHelpAndExit(),
                 _ => UnknownCommand(command),
             };
@@ -967,6 +973,249 @@ internal static class Program
             try { ff?.Dispose(); } catch { }
             try { File.Delete(tempWem); } catch { }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  video 子命令：USM → MP4 转换
+    // ─────────────────────────────────────────────────────────────
+
+    private sealed class VideoArgs
+    {
+        public string? VfsPath;
+        public string? OutPath;
+        public string Format = "mp4";  // mp4 | usm
+        public string Block = "all";   // all | video | auditvideo
+        public string? FfmpegPath;
+        public int Threads = Environment.ProcessorCount;
+    }
+
+    private static int RunVideo(ReadOnlySpan<string> args)
+    {
+        var parsed = new VideoArgs();
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            switch (a)
+            {
+                case "--vfs":
+                    parsed.VfsPath = RequireValue(args, ref i, a);
+                    break;
+                case "--out":
+                case "-o":
+                    parsed.OutPath = RequireValue(args, ref i, a);
+                    break;
+                case "--format":
+                case "-f":
+                    parsed.Format = RequireValue(args, ref i, a).ToLowerInvariant();
+                    break;
+                case "--block":
+                case "-b":
+                    parsed.Block = RequireValue(args, ref i, a).ToLowerInvariant();
+                    break;
+                case "--ffmpeg":
+                    parsed.FfmpegPath = RequireValue(args, ref i, a);
+                    break;
+                case "--threads":
+                case "-t":
+                    parsed.Threads = int.Parse(RequireValue(args, ref i, a));
+                    break;
+                default:
+                    throw new ArgumentException($"Unknown argument: {a}");
+            }
+        }
+
+        if (parsed.VfsPath is null) throw new ArgumentException("--vfs is required");
+        if (parsed.OutPath is null) throw new ArgumentException("--out is required");
+        if (parsed.Format is not ("mp4" or "usm"))
+            throw new ArgumentException($"--format must be mp4 or usm, got: {parsed.Format}");
+
+        var blocks = parsed.Block switch
+        {
+            "all"       => new[] { BlockType.Video, BlockType.AuditVideo },
+            "video"     => new[] { BlockType.Video },
+            "auditvideo" => new[] { BlockType.AuditVideo },
+            _ => throw new ArgumentException($"Unknown block: {parsed.Block} (expected all|video|auditvideo)"),
+        };
+
+        Directory.CreateDirectory(parsed.OutPath);
+        RunVideoPipeline(parsed, blocks);
+        return 0;
+    }
+
+    private static void RunVideoPipeline(VideoArgs parsed, BlockType[] blocks)
+    {
+        var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key);
+        bool wantMp4 = parsed.Format == "mp4";
+
+        // ffmpeg 探测
+        string? ffmpeg = wantMp4 ? parsed.FfmpegPath : null;
+        if (wantMp4 && string.IsNullOrEmpty(ffmpeg))
+        {
+            var candidates = new[] { "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg" };
+            foreach (var c in candidates)
+            {
+                try
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = c,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                    };
+                    psi.ArgumentList.Add("-version");
+                    using var proc = Process.Start(psi);
+                    if (proc != null)
+                    {
+                        proc.WaitForExit(3000);
+                        if (proc.ExitCode == 0)
+                        {
+                            ffmpeg = c;
+                            Console.WriteLine($"  Found ffmpeg: {c}");
+                            break;
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(ffmpeg))
+            {
+                Console.WriteLine("  Warning: ffmpeg not found, falling back to .usm output.");
+                Console.WriteLine("  Hint: install ffmpeg or pass --ffmpeg <path>");
+                wantMp4 = false;
+            }
+        }
+
+        // 收集所有 USM 文件
+        var usmFiles = new List<(string Name, byte[] Data, BlockType BT)>();
+        foreach (var bt in blocks)
+        {
+            Console.WriteLine($"Scanning {bt}...");
+            var info = loader.LoadBlockInfo(bt);
+            foreach (var chunk in info.Chunks)
+            {
+                foreach (var file in chunk.Files)
+                {
+                    if (file.FileName.EndsWith(".usm", StringComparison.OrdinalIgnoreCase))
+                    {
+                        byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
+                        usmFiles.Add((file.FileName, data, bt));
+                    }
+                }
+            }
+        }
+
+        Console.WriteLine($"Found {usmFiles.Count} USM files");
+        if (usmFiles.Count == 0) return;
+
+        int success = 0, errors = 0;
+        var locker = new object();
+
+        Parallel.ForEach(usmFiles, new ParallelOptions { MaxDegreeOfParallelism = parsed.Threads }, (usm) =>
+        {
+            try
+            {
+                string outName = wantMp4
+                    ? Path.ChangeExtension(usm.Name, ".mp4")
+                    : usm.Name;
+                string outPath = Path.Combine(parsed.OutPath!, outName);
+                string? dir = Path.GetDirectoryName(outPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                if (wantMp4 && ffmpeg != null)
+                {
+                    ConvertUsmToMp4(usm.Data, outPath, ffmpeg);
+                }
+                else
+                {
+                    File.WriteAllBytes(outPath, usm.Data);
+                }
+
+                Interlocked.Increment(ref success);
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref errors);
+                Console.Error.WriteLine($"  Error: {usm.Name}: {ex.Message}");
+            }
+        });
+
+        Console.WriteLine($"\nComplete: {success} files converted ({errors} errors)");
+    }
+
+    /// <summary>
+    /// USM → MP4：demux 提取 m2v + 音频 → ffmpeg 封装 MP4（stream copy，不重编码）。
+    /// 临时文件写到 /dev/shm。
+    /// </summary>
+    private static void ConvertUsmToMp4(byte[] usmData, string outPath, string ffmpegPath)
+    {
+        var demuxed = UsmDemuxer.Demux(usmData);
+
+        string scratchDir = WavScratchDir.Value;
+        string stamp = $"v_{Environment.CurrentManagedThreadId}_{Guid.NewGuid():N}";
+        string tempVideo = Path.Combine(scratchDir, $"{stamp}.m2v");
+        string? tempAudio = null;
+
+        File.WriteAllBytes(tempVideo, demuxed.Video);
+        if (demuxed.Audio != null && demuxed.Audio.Length > 0)
+        {
+            tempAudio = Path.Combine(scratchDir, $"{stamp}{demuxed.AudioExtension}");
+            File.WriteAllBytes(tempAudio, demuxed.Audio);
+        }
+
+        try
+        {
+            // 先尝试视频+音频合并
+            bool ok = TryRemuxWithFfmpeg(ffmpegPath, tempVideo, tempAudio, outPath);
+            if (!ok && tempAudio != null)
+            {
+                // 音频合并失败 → 仅视频
+                ok = TryRemuxWithFfmpeg(ffmpegPath, tempVideo, null, outPath);
+            }
+            if (!ok)
+                throw new InvalidOperationException("ffmpeg remux failed (see stderr above)");
+        }
+        finally
+        {
+            try { File.Delete(tempVideo); } catch { }
+            if (tempAudio != null) { try { File.Delete(tempAudio); } catch { }
+            }
+        }
+    }
+
+    private static bool TryRemuxWithFfmpeg(string ffmpegPath, string videoPath, string? audioPath, string outPath)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = ffmpegPath,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.ArgumentList.Add("-y");
+        psi.ArgumentList.Add("-loglevel"); psi.ArgumentList.Add("error");
+        psi.ArgumentList.Add("-i"); psi.ArgumentList.Add(videoPath);
+        if (audioPath != null)
+        {
+            psi.ArgumentList.Add("-i"); psi.ArgumentList.Add(audioPath);
+            psi.ArgumentList.Add("-map"); psi.ArgumentList.Add("0:v");
+            psi.ArgumentList.Add("-map"); psi.ArgumentList.Add("1:a");
+            psi.ArgumentList.Add("-c"); psi.ArgumentList.Add("copy");
+        }
+        else
+        {
+            psi.ArgumentList.Add("-c"); psi.ArgumentList.Add("copy");
+        }
+        psi.ArgumentList.Add(outPath);
+
+        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("启动 ffmpeg 失败");
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        proc.WaitForExit();
+        string stderr = stderrTask.GetAwaiter().GetResult();
+        return proc.ExitCode == 0;
     }
 
     /// <summary>
