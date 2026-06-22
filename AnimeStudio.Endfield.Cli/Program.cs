@@ -577,12 +577,19 @@ internal static class Program
                         using var proc = Process.Start(psi);
                         if (proc != null)
                         {
-                            proc.WaitForExit(3000);
-                            if (proc.ExitCode == 0)
+                            if (proc.WaitForExit(3000))
                             {
-                                ffmpeg = c;
-                                Console.WriteLine($"  Found ffmpeg: {c}");
-                                break;
+                                if (proc.ExitCode == 0)
+                                {
+                                    ffmpeg = c;
+                                    Console.WriteLine($"  Found ffmpeg: {c}");
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                // 超时：进程可能挂死，必须 kill 避免泄漏
+                                try { proc.Kill(entireProcessTree: true); } catch { }
                             }
                         }
                     }
@@ -796,11 +803,8 @@ internal static class Program
 
         Console.WriteLine($"\nComplete: extracted {totalSuccess} files ({totalUnmapped} unmapped, {totalErrors} errors)");
 
-        // 清理 vgmstream 临时目录
-        if (WavScratchDir.IsValueCreated)
-        {
-            try { Directory.Delete(WavScratchDir.Value, recursive: true); } catch { }
-        }
+        // 注意：不删除 WavScratchDir 目录本身，否则同一进程内后续调用 RunAudioPipeline
+        // 会因为 Lazy<> 不再重新初始化而失败。临时文件已经在 WriteWav/WriteMp3 的 finally 中清理。
     }
 
     private static List<(string Name, byte[] Data)> ExtractPckFiles(VfsLoader loader, BlockType bt)
@@ -956,8 +960,10 @@ internal static class Program
             var ffOutTask = ff.StandardOutput.ReadToEndAsync();
 
             vgm.WaitForExit();
-            copyTask.Wait();
             ff.WaitForExit();
+            // ffmpeg/vgmstream 已退出后再等 copyTask；若 ffmpeg 提前失败导致 broken pipe,
+            // copyTask 会抛 IOException, 这里安全吞掉以让真实 exitCode 错误透出
+            try { copyTask.Wait(); } catch { }
 
             string vgmErr = vgmErrTask.GetAwaiter().GetResult();
             string ffErr = ffErrTask.GetAwaiter().GetResult();
@@ -969,6 +975,9 @@ internal static class Program
         }
         finally
         {
+            // Process.Dispose() 只释放 handle, 不会终止运行中的进程; 主动 kill 避免泄漏
+            try { if (vgm is { HasExited: false }) vgm.Kill(entireProcessTree: true); } catch { }
+            try { if (ff is { HasExited: false }) ff.Kill(entireProcessTree: true); } catch { }
             try { vgm?.Dispose(); } catch { }
             try { ff?.Dispose(); } catch { }
             try { File.Delete(tempWem); } catch { }
@@ -1068,12 +1077,19 @@ internal static class Program
                     using var proc = Process.Start(psi);
                     if (proc != null)
                     {
-                        proc.WaitForExit(3000);
-                        if (proc.ExitCode == 0)
+                        if (proc.WaitForExit(3000))
                         {
-                            ffmpeg = c;
-                            Console.WriteLine($"  Found ffmpeg: {c}");
-                            break;
+                            if (proc.ExitCode == 0)
+                            {
+                                ffmpeg = c;
+                                Console.WriteLine($"  Found ffmpeg: {c}");
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            // 超时：进程可能挂死，必须 kill 避免泄漏
+                            try { proc.Kill(entireProcessTree: true); } catch { }
                         }
                     }
                 }
