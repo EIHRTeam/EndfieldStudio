@@ -462,25 +462,46 @@ internal static class Program
         string? vgmstream = wantWav ? parsed.VgmstreamPath : null;
         if (wantWav && string.IsNullOrEmpty(vgmstream))
         {
-            // 自动探测 fluffy-dumper 目录下的 vgmstream-cli
-            var candidates = new[]
+            // 自动探测 vgmstream-cli
+            string vfsAbs = Path.GetFullPath(parsed.VfsPath!);
+            string? vfsParent = Path.GetDirectoryName(vfsAbs.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            string? gameRoot = vfsParent != null ? Path.GetDirectoryName(vfsParent) : null;
+            string cwd = Directory.GetCurrentDirectory();
+            string exeDir = AppContext.BaseDirectory;
+
+            var candidates = new List<string>();
+            void Add(string? baseDir)
             {
-                Path.Combine(parsed.VfsPath!, "..", "..", "fluffy-dumper", "vgmstream", "bin", "linux", "vgmstream-cli"),
-                "/usr/local/bin/vgmstream-cli",
-                "vgmstream-cli",
-            };
+                if (string.IsNullOrEmpty(baseDir)) return;
+                candidates.Add(Path.Combine(baseDir, "fluffy-dumper", "vgmstream", "bin", "linux", "vgmstream-cli"));
+                candidates.Add(Path.Combine(baseDir, "vgmstream", "bin", "linux", "vgmstream-cli"));
+                candidates.Add(Path.Combine(baseDir, "vgmstream-cli"));
+            }
+            Add(cwd);
+            Add(vfsParent);
+            Add(gameRoot);
+            Add(exeDir);
+            candidates.Add("/usr/local/bin/vgmstream-cli");
+            candidates.Add("/usr/bin/vgmstream-cli");
+            candidates.Add("vgmstream-cli");
+
             foreach (var c in candidates)
             {
-                if (File.Exists(c))
+                try
                 {
-                    vgmstream = c;
-                    Console.WriteLine($"  Found vgmstream-cli: {c}");
-                    break;
+                    if (File.Exists(c))
+                    {
+                        vgmstream = Path.GetFullPath(c);
+                        Console.WriteLine($"  Found vgmstream-cli: {vgmstream}");
+                        break;
+                    }
                 }
+                catch { }
             }
             if (string.IsNullOrEmpty(vgmstream))
             {
                 Console.WriteLine("  Warning: vgmstream-cli not found, falling back to .wem output.");
+                Console.WriteLine("  Hint: pass --vgmstream <path> or place vgmstream-cli in fluffy-dumper/vgmstream/bin/linux/");
                 wantWav = false;
             }
         }
@@ -661,6 +682,12 @@ internal static class Program
         }
 
         Console.WriteLine($"\nComplete: extracted {totalSuccess} files ({totalUnmapped} unmapped, {totalErrors} errors)");
+
+        // 清理 vgmstream 临时目录
+        if (WavScratchDir.IsValueCreated)
+        {
+            try { Directory.Delete(WavScratchDir.Value, recursive: true); } catch { }
+        }
     }
 
     private static List<(string Name, byte[] Data)> ExtractPckFiles(VfsLoader loader, BlockType bt)
@@ -683,13 +710,25 @@ internal static class Program
         return result;
     }
 
+    // 用于 vgmstream 临时输入文件的目录（优先 /dev/shm，其次系统 temp）
+    private static readonly Lazy<string> WavScratchDir = new(() =>
+    {
+        string baseDir = Directory.Exists("/dev/shm") ? "/dev/shm" : Path.GetTempPath();
+        string dir = Path.Combine(baseDir, $"endfield-wav-{Environment.ProcessId}");
+        Directory.CreateDirectory(dir);
+        return dir;
+    });
+
     private static void WriteWavViaVgmstream(byte[] wemData, string outPath, string vgmstreamCli)
     {
         string? dir = Path.GetDirectoryName(outPath);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-        // 写临时 .wem 文件
-        string tempWem = outPath + ".tmp.wem";
+        // 临时 wem 文件放在 /dev/shm（tmpfs，纯内存）下，避免磁盘 IO 干扰
+        // 并发安全：每个 wem 用 GUID + 线程 ID 命名，绝不重复
+        string tempWem = Path.Combine(
+            WavScratchDir.Value,
+            $"w_{Environment.CurrentManagedThreadId}_{Guid.NewGuid():N}.wem");
         File.WriteAllBytes(tempWem, wemData);
 
         try
@@ -698,6 +737,7 @@ internal static class Program
             {
                 FileName = vgmstreamCli,
                 RedirectStandardError = true,
+                RedirectStandardOutput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
@@ -706,8 +746,11 @@ internal static class Program
             psi.ArgumentList.Add(tempWem);
 
             using var proc = Process.Start(psi)!;
-            string stderr = proc.StandardError.ReadToEnd();
+            // 同时读 stderr/stdout 避免管道阻塞
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
             proc.WaitForExit();
+            string stderr = stderrTask.GetAwaiter().GetResult();
             if (proc.ExitCode != 0)
             {
                 throw new InvalidOperationException($"vgmstream exit {proc.ExitCode}: {stderr}");
@@ -715,10 +758,7 @@ internal static class Program
         }
         finally
         {
-            if (File.Exists(tempWem))
-            {
-                try { File.Delete(tempWem); } catch { }
-            }
+            try { File.Delete(tempWem); } catch { }
         }
     }
 
@@ -1362,9 +1402,60 @@ internal static class Program
         if (lower.StartsWith("activity_")) return "activity";
         if (lower.StartsWith("prts_")) return "prts";
         if (lower.StartsWith("dung")) return "dungeon";
+        if (lower.StartsWith("slu__dung")) return "dungeon";  // Slu__dung02_xxx 关卡截图
+        if (lower.StartsWith("slu__map")) return "map";       // Slu__map02_xxx 地图截图
+        if (lower.StartsWith("slu__ld")) return "level";      // Slu__ld_xxx 关卡截图
+        if (lower.StartsWith("slu__")) return "snapshot";     // 其他 Slu__ 通用截图
         if (lower.StartsWith("dlg_")) return "dialog";
         if (lower.StartsWith("gacha")) return "gacha";
         if (lower.StartsWith("image_")) return "image";
+
+        // 新增：UI 装饰类
+        if (lower.StartsWith("deco_") || lower.StartsWith("deco-") ||
+            lower.StartsWith("line_") || lower.StartsWith("line-")) return "decoration";
+        if (lower.StartsWith("btn_") || lower.StartsWith("btn-")) return "button";
+        if (lower.StartsWith("common_") || lower.StartsWith("common-")) return "common_ui";
+        if (lower.StartsWith("uisprite")) return "ui_sprite";
+        if (lower.StartsWith("emoji_") || lower.StartsWith("emoji-")) return "emoji";
+
+        // 新增：系统/玩法类
+        if (lower.StartsWith("guide_") || lower.StartsWith("guide-")) return "guide";
+        if (lower.StartsWith("tech_") || lower.StartsWith("tech-")) return "tech";
+        if (lower.StartsWith("eny_") || lower.StartsWith("eny-") ||
+            lower.StartsWith("enemy_") || lower.StartsWith("enemy-")) return "enemy";
+        if (lower.StartsWith("wiki_") || lower.StartsWith("wiki-")) return "wiki";
+        if (lower.StartsWith("shop_") || lower.StartsWith("shop-") ||
+            lower.StartsWith("monthlypass")) return "shop";
+        if (lower.StartsWith("map_") || lower.StartsWith("map-")) return "map";
+        if (lower.StartsWith("collection_") || lower.StartsWith("collection-")) return "collection";
+        if (lower.StartsWith("document_") || lower.StartsWith("document-")) return "document";
+        if (lower.StartsWith("seasonal_") || lower.StartsWith("seasonal-")) return "seasonal";
+
+        // 新增：游戏系统类
+        if (lower.StartsWith("textfactorycommonui")) return "factory_ui";
+        if (lower.StartsWith("dwr_") || lower.StartsWith("dwr-")) return "dwr";  // 探索系统
+        if (lower.StartsWith("facskill_") || lower.StartsWith("facskill-")) return "factory_skill";
+        if (lower.StartsWith("aibark_") || lower.StartsWith("aibark-")) return "aibark";
+        if (lower.StartsWith("reception_") || lower.StartsWith("reception-")) return "reception";
+        if (lower.StartsWith("racing_") || lower.StartsWith("racing-")) return "racing";
+        if (lower.StartsWith("remotecomm_") || lower.StartsWith("remotecomm-")) return "remotecomm";
+        if (lower.StartsWith("achievement_") || lower.StartsWith("achievement-")) return "achievement";
+        if (lower.StartsWith("potential_") || lower.StartsWith("potential-")) return "item_potential";
+        if (lower.StartsWith("weapon_") || lower.StartsWith("weapon-")) return "weapon";
+        if (lower.StartsWith("boss_") || lower.StartsWith("boss-")) return "boss";
+        if (lower.StartsWith("snapshot_") || lower.StartsWith("snapshot-")) return "snapshot";
+        if (lower.StartsWith("poster_") || lower.StartsWith("poster-")) return "poster";
+        if (lower.StartsWith("adventure_") || lower.StartsWith("adventure-")) return "adventure";
+        if (lower.StartsWith("mail_") || lower.StartsWith("mail-")) return "mail";
+        if (lower.StartsWith("chapter_") || lower.StartsWith("chapter-")) return "chapter";
+        if (lower.StartsWith("cover_") || lower.StartsWith("cover-")) return "cover";
+        if (lower.StartsWith("reading_") || lower.StartsWith("reading-")) return "reading";
+        if (lower.StartsWith("text_") || lower.StartsWith("text-")) return "text";
+        if (lower.StartsWith("img_") || lower.StartsWith("img-")) return "image";
+        if (lower.StartsWith("ui_") || lower.StartsWith("ui-")) return "ui";
+        if (lower.StartsWith("prgs_") || lower.StartsWith("prgs-")) return "progress";
+        if (lower.StartsWith("decal_") || lower.StartsWith("decal-")) return "decal";
+        if (lower.StartsWith("map02") || lower.StartsWith("map03")) return "map";
 
         return "other";
     }
