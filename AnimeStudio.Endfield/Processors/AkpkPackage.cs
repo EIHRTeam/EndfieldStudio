@@ -262,10 +262,11 @@ public sealed class AkpkPackage
     /// </summary>
     public byte[] GetWemData(WemEntry entry)
     {
+        if (entry.Offset > (ulong)_data.Length ||
+            entry.Size > (ulong)_data.Length ||
+            entry.Offset + entry.Size > (ulong)_data.Length)
+            throw new InvalidDataException($"WEM 越界: offset={entry.Offset}, size={entry.Size}, data 长度={_data.Length}");
         int start = (int)entry.Offset;
-        int end = start + (int)entry.Size;
-        if (start < 0 || end > _data.Length)
-            throw new InvalidDataException($"WEM 越界: offset={start}, size={entry.Size}, data 长度={_data.Length}");
         var data = new byte[entry.Size];
         Array.Copy(_data, start, data, 0, data.Length);
 
