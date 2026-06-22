@@ -7,6 +7,7 @@ using SixLabors.ImageSharp.Formats.Bmp;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Tga;
 using SixLabors.ImageSharp.PixelFormats;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime;
 using System.Text.RegularExpressions;
@@ -30,8 +31,10 @@ internal static class Program
                                 [--exclude-material] [--classify]
           endfield-dump audio   --vfs <streaming_assets_path> --out <dir>
                                 [--language all|chinese|english|japanese|korean]
-                                [--format wem|wav] [--block all|audio|initialaudio|auditaudio|voice]
-                                [--vgmstream <path>] [--threads N]
+                                [--format wem|wav|mp3] [--block all|audio|initialaudio|auditaudio|voice]
+                                [--vgmstream <path>] [--ffmpeg <path>]
+                                [--mp3-bitrate 192] [--mp3-quality best|high|medium|low|minimum|0-9]
+                                [--threads N]
 
         Block types (case-insensitive). If omitted, all dumpable types are processed.
           InitialAudio, InitialBundle, InitialExtendData, BundleManifest, IFixPatch,
@@ -341,9 +344,12 @@ internal static class Program
         public string? VfsPath;
         public string? OutPath;
         public List<AudioMap.Language> Languages = new();
-        public string Format = "wem";  // wem | wav
+        public string Format = "wem";  // wem | wav | mp3
         public List<BlockType> Blocks = new();
         public string? VgmstreamPath;
+        public string? FfmpegPath;
+        public int Mp3Bitrate = 192;  // kbps，仅 mp3 模式使用（默认 192，VBR-quality 折中）
+        public int? Mp3Vbr;            // VBR 质量等级 0-9（数字越小越好，0≈245kbps, 4≈165kbps, 9≈65kbps）
         public int Threads;
     }
 
@@ -383,6 +389,31 @@ internal static class Program
                 case "--vgmstream":
                     parsed.VgmstreamPath = RequireValue(args, ref i, a);
                     break;
+                case "--ffmpeg":
+                    parsed.FfmpegPath = RequireValue(args, ref i, a);
+                    break;
+                case "--mp3-bitrate":
+                    parsed.Mp3Bitrate = int.Parse(RequireValue(args, ref i, a));
+                    parsed.Mp3Vbr = null;  // CBR 模式覆盖 VBR
+                    break;
+                case "--mp3-quality":
+                case "--mp3-vbr":
+                    {
+                        string val = RequireValue(args, ref i, a).ToLowerInvariant();
+                        // 预设别名
+                        parsed.Mp3Vbr = val switch
+                        {
+                            "best"    => 0,  // ~245 kbps
+                            "high"    => 2,  // ~190 kbps
+                            "medium"  => 4,  // ~165 kbps
+                            "low"     => 6,  // ~115 kbps
+                            "minimum" => 9,  // ~65 kbps
+                            _ when int.TryParse(val, out int q) && q is >= 0 and <= 9 => q,
+                            _ => throw new ArgumentException(
+                                $"--mp3-quality must be 0-9 or best|high|medium|low|minimum, got: {val}"),
+                        };
+                    }
+                    break;
                 case "--threads":
                 case "-t":
                     parsed.Threads = int.Parse(RequireValue(args, ref i, a));
@@ -394,8 +425,10 @@ internal static class Program
 
         if (parsed.VfsPath is null) throw new ArgumentException("--vfs is required");
         if (parsed.OutPath is null) throw new ArgumentException("--out is required");
-        if (parsed.Format is not ("wem" or "wav"))
-            throw new ArgumentException($"--format must be wem or wav, got: {parsed.Format}");
+        if (parsed.Format is not ("wem" or "wav" or "mp3"))
+            throw new ArgumentException($"--format must be wem, wav, or mp3, got: {parsed.Format}");
+        if (parsed.Mp3Bitrate < 8 || parsed.Mp3Bitrate > 320)
+            throw new ArgumentException($"--mp3-bitrate must be in range [8, 320], got: {parsed.Mp3Bitrate}");
 
         // 语言
         parsed.Languages = langStr.ToLowerInvariant() switch
@@ -455,32 +488,127 @@ internal static class Program
     private static void RunAudioPipeline(AudioArgs parsed)
     {
         var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key);
-        bool wantWav = parsed.Format == "wav";
+        // 当前生效的输出格式（探测失败会降级到 wem）
+        string outFmt = parsed.Format;  // wem | wav | mp3
+        bool needVgmstream = outFmt is "wav" or "mp3";
+        bool needFfmpeg = outFmt == "mp3";
 
-        // vgmstream 可选（wav 模式才需要）
-        string? vgmstream = wantWav ? parsed.VgmstreamPath : null;
-        if (wantWav && string.IsNullOrEmpty(vgmstream))
+        // vgmstream 探测
+        string? vgmstream = needVgmstream ? parsed.VgmstreamPath : null;
+        if (needVgmstream && string.IsNullOrEmpty(vgmstream))
         {
-            // 自动探测 fluffy-dumper 目录下的 vgmstream-cli
-            var candidates = new[]
+            string vfsAbs = Path.GetFullPath(parsed.VfsPath!);
+            string? vfsParent = Path.GetDirectoryName(vfsAbs.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            string? gameRoot = vfsParent != null ? Path.GetDirectoryName(vfsParent) : null;
+            string cwd = Directory.GetCurrentDirectory();
+            string exeDir = AppContext.BaseDirectory;
+
+            var candidates = new List<string>();
+            void Add(string? baseDir)
             {
-                Path.Combine(parsed.VfsPath!, "..", "..", "fluffy-dumper", "vgmstream", "bin", "linux", "vgmstream-cli"),
-                "/usr/local/bin/vgmstream-cli",
-                "vgmstream-cli",
-            };
+                if (string.IsNullOrEmpty(baseDir)) return;
+                candidates.Add(Path.Combine(baseDir, "fluffy-dumper", "vgmstream", "bin", "linux", "vgmstream-cli"));
+                candidates.Add(Path.Combine(baseDir, "vgmstream", "bin", "linux", "vgmstream-cli"));
+                candidates.Add(Path.Combine(baseDir, "vgmstream-cli"));
+            }
+            Add(cwd);
+            Add(vfsParent);
+            Add(gameRoot);
+            Add(exeDir);
+            candidates.Add("/usr/local/bin/vgmstream-cli");
+            candidates.Add("/usr/bin/vgmstream-cli");
+            candidates.Add("vgmstream-cli");
+
             foreach (var c in candidates)
             {
-                if (File.Exists(c))
+                try
                 {
-                    vgmstream = c;
-                    Console.WriteLine($"  Found vgmstream-cli: {c}");
-                    break;
+                    if (File.Exists(c))
+                    {
+                        vgmstream = Path.GetFullPath(c);
+                        Console.WriteLine($"  Found vgmstream-cli: {vgmstream}");
+                        break;
+                    }
                 }
+                catch { }
             }
             if (string.IsNullOrEmpty(vgmstream))
             {
                 Console.WriteLine("  Warning: vgmstream-cli not found, falling back to .wem output.");
-                wantWav = false;
+                Console.WriteLine("  Hint: pass --vgmstream <path> or place vgmstream-cli in fluffy-dumper/vgmstream/bin/linux/");
+                outFmt = "wem";
+                needVgmstream = false;
+                needFfmpeg = false;
+            }
+        }
+
+        // ffmpeg 探测（mp3 模式需要）
+        string? ffmpeg = needFfmpeg ? parsed.FfmpegPath : null;
+        if (needFfmpeg && string.IsNullOrEmpty(ffmpeg))
+        {
+            var ffCandidates = new[]
+            {
+                "/usr/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "ffmpeg",
+            };
+            foreach (var c in ffCandidates)
+            {
+                try
+                {
+                    // 尝试在 PATH 中查找
+                    if (c == "ffmpeg" || File.Exists(c))
+                    {
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = c,
+                            ArgumentList = { "-version" },
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                        };
+                        using var proc = Process.Start(psi);
+                        if (proc != null)
+                        {
+                            proc.WaitForExit(3000);
+                            if (proc.ExitCode == 0)
+                            {
+                                ffmpeg = c;
+                                Console.WriteLine($"  Found ffmpeg: {c}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(ffmpeg))
+            {
+                Console.WriteLine("  Warning: ffmpeg not found, falling back to .wav output.");
+                Console.WriteLine("  Hint: install ffmpeg or pass --ffmpeg <path>");
+                outFmt = "wav";
+                needFfmpeg = false;
+            }
+            else
+            {
+                if (parsed.Mp3Vbr.HasValue)
+                {
+                    string preset = parsed.Mp3Vbr.Value switch
+                    {
+                        0 => "best (~245kbps)",
+                        2 => "high (~190kbps)",
+                        4 => "medium (~165kbps)",
+                        6 => "low (~115kbps)",
+                        9 => "minimum (~65kbps)",
+                        _ => $"Q{parsed.Mp3Vbr.Value}",
+                    };
+                    Console.WriteLine($"  MP3 mode: VBR {preset}");
+                }
+                else
+                {
+                    Console.WriteLine($"  MP3 mode: CBR {parsed.Mp3Bitrate} kbps");
+                }
             }
         }
 
@@ -505,7 +633,10 @@ internal static class Program
                 if (audioDialogJson != null) break;
             }
         }
-        catch (DirectoryNotFoundException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Warning: failed to load AudioDialog table: {ex.Message}");
+        }
 
         if (audioDialogJson == null)
         {
@@ -592,7 +723,9 @@ internal static class Program
                             }
 
                             // 校验 RIFF/RIFX 头
-                            if (wemData[0] != (byte)'R' || (wemData[3] != (byte)'F'))
+                            if (wemData[0] != (byte)'R' || wemData[1] != (byte)'I' ||
+                                wemData[2] != (byte)'F' ||
+                                (wemData[3] != (byte)'F' && wemData[3] != (byte)'X'))
                             {
                                 Interlocked.Increment(ref localErrors);
                                 return;
@@ -600,20 +733,17 @@ internal static class Program
 
                             string hash = $"{entry.Id:x}";
                             string outPath;
+                            string outExt = "." + outFmt;  // .wem | .wav | .mp3
 
                             if (audioMap.GetPath(hash) is string mappedPath)
                             {
-                                string ext = wantWav ? ".wav" : ".wem";
-                                string pathWithExt = mappedPath.Replace(".wem", ext, StringComparison.OrdinalIgnoreCase);
-                                if (wantWav && !pathWithExt.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
-                                    pathWithExt = Path.ChangeExtension(pathWithExt, ".wav");
+                                string pathWithExt = Path.ChangeExtension(mappedPath, outExt);
                                 outPath = Path.Combine(parsed.OutPath!, pathWithExt);
                             }
                             else
                             {
                                 Interlocked.Increment(ref localUnmapped);
-                                string ext = wantWav ? ".wav" : ".wem";
-                                string filename = $"{entry.Id}{ext}";
+                                string filename = $"{entry.Id}{outExt}";
                                 outPath = Path.Combine(
                                     parsed.OutPath!,
                                     "unmapped",
@@ -624,7 +754,11 @@ internal static class Program
                             string? dir = Path.GetDirectoryName(outPath);
                             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-                            if (wantWav && vgmstream != null)
+                            if (outFmt == "mp3" && vgmstream != null && ffmpeg != null)
+                            {
+                                WriteMp3ViaPipe(wemData, outPath, vgmstream, ffmpeg, parsed.Mp3Bitrate, parsed.Mp3Vbr);
+                            }
+                            else if (outFmt == "wav" && vgmstream != null)
                             {
                                 WriteWavViaVgmstream(wemData, outPath, vgmstream);
                             }
@@ -655,6 +789,12 @@ internal static class Program
         }
 
         Console.WriteLine($"\nComplete: extracted {totalSuccess} files ({totalUnmapped} unmapped, {totalErrors} errors)");
+
+        // 清理 vgmstream 临时目录
+        if (WavScratchDir.IsValueCreated)
+        {
+            try { Directory.Delete(WavScratchDir.Value, recursive: true); } catch { }
+        }
     }
 
     private static List<(string Name, byte[] Data)> ExtractPckFiles(VfsLoader loader, BlockType bt)
@@ -677,13 +817,25 @@ internal static class Program
         return result;
     }
 
+    // 用于 vgmstream 临时输入文件的目录（优先 /dev/shm，其次系统 temp）
+    private static readonly Lazy<string> WavScratchDir = new(() =>
+    {
+        string baseDir = Directory.Exists("/dev/shm") ? "/dev/shm" : Path.GetTempPath();
+        string dir = Path.Combine(baseDir, $"endfield-wav-{Environment.ProcessId}");
+        Directory.CreateDirectory(dir);
+        return dir;
+    });
+
     private static void WriteWavViaVgmstream(byte[] wemData, string outPath, string vgmstreamCli)
     {
         string? dir = Path.GetDirectoryName(outPath);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-        // 写临时 .wem 文件
-        string tempWem = outPath + ".tmp.wem";
+        // 临时 wem 文件放在 /dev/shm（tmpfs，纯内存）下，避免磁盘 IO 干扰
+        // 并发安全：每个 wem 用 GUID + 线程 ID 命名，绝不重复
+        string tempWem = Path.Combine(
+            WavScratchDir.Value,
+            $"w_{Environment.CurrentManagedThreadId}_{Guid.NewGuid():N}.wem");
         File.WriteAllBytes(tempWem, wemData);
 
         try
@@ -692,6 +844,7 @@ internal static class Program
             {
                 FileName = vgmstreamCli,
                 RedirectStandardError = true,
+                RedirectStandardOutput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
@@ -700,8 +853,11 @@ internal static class Program
             psi.ArgumentList.Add(tempWem);
 
             using var proc = Process.Start(psi)!;
-            string stderr = proc.StandardError.ReadToEnd();
+            // 同时读 stderr/stdout 避免管道阻塞
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
             proc.WaitForExit();
+            string stderr = stderrTask.GetAwaiter().GetResult();
             if (proc.ExitCode != 0)
             {
                 throw new InvalidOperationException($"vgmstream exit {proc.ExitCode}: {stderr}");
@@ -709,10 +865,107 @@ internal static class Program
         }
         finally
         {
-            if (File.Exists(tempWem))
+            try { File.Delete(tempWem); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// 流水线：vgmstream-cli 解码 WEM 到 stdout (-p) → ffmpeg 从 stdin 编码 MP3 写到 outPath。
+    /// 全程零中间 WAV 文件落盘，节省 IO 和磁盘空间。
+    /// </summary>
+    private static void WriteMp3ViaPipe(byte[] wemData, string outPath, string vgmstreamCli, string ffmpegPath, int bitrate, int? vbrQuality)
+    {
+        string? dir = Path.GetDirectoryName(outPath);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        // 输入 WEM 写到 tmpfs 临时文件（vgmstream-cli 不支持 stdin）
+        string tempWem = Path.Combine(
+            WavScratchDir.Value,
+            $"w_{Environment.CurrentManagedThreadId}_{Guid.NewGuid():N}.wem");
+        File.WriteAllBytes(tempWem, wemData);
+
+        Process? vgm = null;
+        Process? ff = null;
+        try
+        {
+            // 1. 启动 vgmstream-cli：-p 输出 WAV 到 stdout
+            var vgmPsi = new ProcessStartInfo
             {
-                try { File.Delete(tempWem); } catch { }
+                FileName = vgmstreamCli,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            vgmPsi.ArgumentList.Add("-p");
+            vgmPsi.ArgumentList.Add(tempWem);
+
+            vgm = Process.Start(vgmPsi) ?? throw new InvalidOperationException("启动 vgmstream-cli 失败");
+
+            // 2. 启动 ffmpeg：从 stdin 读 wav，编码 MP3 写 outPath
+            var ffPsi = new ProcessStartInfo
+            {
+                FileName = ffmpegPath,
+                RedirectStandardInput = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            ffPsi.ArgumentList.Add("-y");                   // 覆盖输出
+            ffPsi.ArgumentList.Add("-loglevel"); ffPsi.ArgumentList.Add("error");
+            ffPsi.ArgumentList.Add("-i"); ffPsi.ArgumentList.Add("pipe:0");
+            ffPsi.ArgumentList.Add("-codec:a"); ffPsi.ArgumentList.Add("libmp3lame");
+            if (vbrQuality.HasValue)
+            {
+                // VBR：-q:a N（N=0~9，越小越好）
+                ffPsi.ArgumentList.Add("-q:a"); ffPsi.ArgumentList.Add(vbrQuality.Value.ToString());
             }
+            else
+            {
+                // CBR：-b:a Nk
+                ffPsi.ArgumentList.Add("-b:a"); ffPsi.ArgumentList.Add($"{bitrate}k");
+            }
+            ffPsi.ArgumentList.Add(outPath);
+
+            ff = Process.Start(ffPsi) ?? throw new InvalidOperationException("启动 ffmpeg 失败");
+
+            // 3. vgmstream stdout → ffmpeg stdin（管道转发）
+            var copyTask = Task.Run(() =>
+            {
+                try
+                {
+                    vgm.StandardOutput.BaseStream.CopyTo(ff.StandardInput.BaseStream);
+                }
+                finally
+                {
+                    try { ff.StandardInput.Close(); } catch { }
+                }
+            });
+
+            // 同时读两边 stderr 防止阻塞
+            var vgmErrTask = vgm.StandardError.ReadToEndAsync();
+            var ffErrTask = ff.StandardError.ReadToEndAsync();
+            // ffmpeg stdout 也读掉避免阻塞
+            var ffOutTask = ff.StandardOutput.ReadToEndAsync();
+
+            vgm.WaitForExit();
+            copyTask.Wait();
+            ff.WaitForExit();
+
+            string vgmErr = vgmErrTask.GetAwaiter().GetResult();
+            string ffErr = ffErrTask.GetAwaiter().GetResult();
+
+            if (vgm.ExitCode != 0)
+                throw new InvalidOperationException($"vgmstream exit {vgm.ExitCode}: {vgmErr}");
+            if (ff.ExitCode != 0)
+                throw new InvalidOperationException($"ffmpeg exit {ff.ExitCode}: {ffErr}");
+        }
+        finally
+        {
+            try { vgm?.Dispose(); } catch { }
+            try { ff?.Dispose(); } catch { }
+            try { File.Delete(tempWem); } catch { }
         }
     }
 
@@ -1008,6 +1261,9 @@ internal static class Program
         long totalBytes = 0;
         int stage1Extracted = 0;
 
+        // 跨 batch 的文件名占位表，防止重名纹理互相覆盖
+        var claimedNames = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+
         // ── Progress task (global) ──
         bool progressEnabled = !Console.IsErrorRedirected;
         var progressCts = new CancellationTokenSource();
@@ -1154,12 +1410,19 @@ internal static class Program
                                                 ? Path.Combine(outPath, ClassifyImage(name))
                                                 : outPath;
 
+                                            // 原子占位：先到先得，重名自动加 PathID 后缀
                                             string outFile = Path.Combine(targetDir, safeName + ext);
-
-                                            if (File.Exists(outFile))
+                                            if (!claimedNames.TryAdd(outFile, 0))
                                             {
                                                 outFile = Path.Combine(targetDir,
                                                     $"{safeName}_{tex.m_PathID:x}{ext}");
+                                                int dup = 2;
+                                                while (!claimedNames.TryAdd(outFile, 0))
+                                                {
+                                                    outFile = Path.Combine(targetDir,
+                                                        $"{safeName}_{tex.m_PathID:x}_{dup}{ext}");
+                                                    dup++;
+                                                }
                                             }
 
                                             string? targetParent = Path.GetDirectoryName(outFile);
@@ -1346,9 +1609,60 @@ internal static class Program
         if (lower.StartsWith("activity_")) return "activity";
         if (lower.StartsWith("prts_")) return "prts";
         if (lower.StartsWith("dung")) return "dungeon";
+        if (lower.StartsWith("slu__dung")) return "dungeon";  // Slu__dung02_xxx 关卡截图
+        if (lower.StartsWith("slu__map")) return "map";       // Slu__map02_xxx 地图截图
+        if (lower.StartsWith("slu__ld")) return "level";      // Slu__ld_xxx 关卡截图
+        if (lower.StartsWith("slu__")) return "snapshot";     // 其他 Slu__ 通用截图
         if (lower.StartsWith("dlg_")) return "dialog";
         if (lower.StartsWith("gacha")) return "gacha";
         if (lower.StartsWith("image_")) return "image";
+
+        // 新增：UI 装饰类
+        if (lower.StartsWith("deco_") || lower.StartsWith("deco-") ||
+            lower.StartsWith("line_") || lower.StartsWith("line-")) return "decoration";
+        if (lower.StartsWith("btn_") || lower.StartsWith("btn-")) return "button";
+        if (lower.StartsWith("common_") || lower.StartsWith("common-")) return "common_ui";
+        if (lower.StartsWith("uisprite")) return "ui_sprite";
+        if (lower.StartsWith("emoji_") || lower.StartsWith("emoji-")) return "emoji";
+
+        // 新增：系统/玩法类
+        if (lower.StartsWith("guide_") || lower.StartsWith("guide-")) return "guide";
+        if (lower.StartsWith("tech_") || lower.StartsWith("tech-")) return "tech";
+        if (lower.StartsWith("eny_") || lower.StartsWith("eny-") ||
+            lower.StartsWith("enemy_") || lower.StartsWith("enemy-")) return "enemy";
+        if (lower.StartsWith("wiki_") || lower.StartsWith("wiki-")) return "wiki";
+        if (lower.StartsWith("shop_") || lower.StartsWith("shop-") ||
+            lower.StartsWith("monthlypass")) return "shop";
+        if (lower.StartsWith("map_") || lower.StartsWith("map-")) return "map";
+        if (lower.StartsWith("collection_") || lower.StartsWith("collection-")) return "collection";
+        if (lower.StartsWith("document_") || lower.StartsWith("document-")) return "document";
+        if (lower.StartsWith("seasonal_") || lower.StartsWith("seasonal-")) return "seasonal";
+
+        // 新增：游戏系统类
+        if (lower.StartsWith("textfactorycommonui")) return "factory_ui";
+        if (lower.StartsWith("dwr_") || lower.StartsWith("dwr-")) return "dwr";  // 探索系统
+        if (lower.StartsWith("facskill_") || lower.StartsWith("facskill-")) return "factory_skill";
+        if (lower.StartsWith("aibark_") || lower.StartsWith("aibark-")) return "aibark";
+        if (lower.StartsWith("reception_") || lower.StartsWith("reception-")) return "reception";
+        if (lower.StartsWith("racing_") || lower.StartsWith("racing-")) return "racing";
+        if (lower.StartsWith("remotecomm_") || lower.StartsWith("remotecomm-")) return "remotecomm";
+        if (lower.StartsWith("achievement_") || lower.StartsWith("achievement-")) return "achievement";
+        if (lower.StartsWith("potential_") || lower.StartsWith("potential-")) return "item_potential";
+        if (lower.StartsWith("weapon_") || lower.StartsWith("weapon-")) return "weapon";
+        if (lower.StartsWith("boss_") || lower.StartsWith("boss-")) return "boss";
+        if (lower.StartsWith("snapshot_") || lower.StartsWith("snapshot-")) return "snapshot";
+        if (lower.StartsWith("poster_") || lower.StartsWith("poster-")) return "poster";
+        if (lower.StartsWith("adventure_") || lower.StartsWith("adventure-")) return "adventure";
+        if (lower.StartsWith("mail_") || lower.StartsWith("mail-")) return "mail";
+        if (lower.StartsWith("chapter_") || lower.StartsWith("chapter-")) return "chapter";
+        if (lower.StartsWith("cover_") || lower.StartsWith("cover-")) return "cover";
+        if (lower.StartsWith("reading_") || lower.StartsWith("reading-")) return "reading";
+        if (lower.StartsWith("text_") || lower.StartsWith("text-")) return "text";
+        if (lower.StartsWith("img_") || lower.StartsWith("img-")) return "image";
+        if (lower.StartsWith("ui_") || lower.StartsWith("ui-")) return "ui";
+        if (lower.StartsWith("prgs_") || lower.StartsWith("prgs-")) return "progress";
+        if (lower.StartsWith("decal_") || lower.StartsWith("decal-")) return "decal";
+        if (lower.StartsWith("map02") || lower.StartsWith("map03")) return "map";
 
         return "other";
     }
