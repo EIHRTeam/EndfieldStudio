@@ -102,25 +102,88 @@ AnimeStudio/
 ### Prerequisites
 
 - .NET 9 SDK
-- Linux x64 (Texture2D decoding via `Kyaru.Texture2DDecoder.Linux` NuGet)
-- For audio: `vgmstream-cli` (auto-detected from `fluffy-dumper/vgmstream/bin/linux/`)
+- Linux x64 or Windows x64 (Texture2D decoding via `Kyaru.Texture2DDecoder` NuGet, auto-selects platform native lib)
+- For audio (WAV/MP3): `vgmstream-cli` — see below
 - For MP3 audio / MP4 video: `ffmpeg` (any version with libmp3lame; auto-detected from PATH)
+
+### Installing vgmstream-cli (for audio extraction)
+
+Audio extraction (WAV/MP3) requires `vgmstream-cli`. Three options:
+
+**Option A: From fluffy-dumper (recommended, known-working version)**
+
+```bash
+git clone https://github.com/Escartem/fluffy-dumper.git
+cd fluffy-dumper
+# Build per fluffy-dumper README, then:
+# Linux:   vgmstream-cli at fluffy-dumper/vgmstream/bin/linux/vgmstream-cli
+# Windows: vgmstream-cli at fluffy-dumper\vgmstream\bin\windows\vgmstream-cli.exe
+```
+
+Place the `fluffy-dumper/` directory next to the `AnimeStudio/` directory (auto-detected), or pass explicitly:
+```bash
+# Linux
+endfield-dump audio --vfs ./StreamingAssets --out ./audio \
+    --vgmstream ./fluffy-dumper/vgmstream/bin/linux/vgmstream-cli \
+    --language chinese --format mp3 --threads 16
+```
+```powershell
+# Windows
+dotnet endfield-dump.dll audio --vfs .\StreamingAssets --out .\audio `
+    --vgmstream .\fluffy-dumper\vgmstream\bin\windows\vgmstream-cli.exe `
+    --language chinese --format mp3 --threads 16
+```
+
+**Option B: System install**
+
+```bash
+# Ubuntu/Debian
+sudo apt install vgmstream  # may be older version
+# Or build from source: https://vgmstream.org/
+```
+```powershell
+# Windows: Download from https://vgmstream.org/ and add to PATH
+# Or: winget install vgmstream
+```
+
+```bash
+endfield-dump audio --vfs ./StreamingAssets --out ./audio \
+    --language chinese --format wav --threads 16
+# vgmstream-cli auto-detected from PATH
+```
+
+**Option C: Skip audio decoding**
+
+```bash
+# Output raw .wem files (no vgmstream needed)
+endfield-dump audio --vfs ./StreamingAssets --out ./audio \
+    --language chinese --format wem --threads 16
+```
 
 ### Build
 
+**Linux:**
 ```bash
 cd AnimeStudio
 dotnet build AnimeStudio.Endfield.Cli -c Release
+# Output: AnimeStudio.Endfield.Cli/bin/Release/net9.0/endfield-dump.dll
+```
+
+**Windows (PowerShell):**
+```powershell
+cd AnimeStudio
+dotnet build AnimeStudio.Endfield.Cli -c Release
+# Output: AnimeStudio.Endfield.Cli\bin\Release\net9.0\endfield-dump.dll
 ```
 
 ### Install as global command
 
+**Linux:**
 ```bash
 ./install.sh
 ```
 
 Or manually:
-
 ```bash
 cat > ~/.local/bin/endfield-dump << 'EOF'
 #!/usr/bin/env bash
@@ -129,17 +192,41 @@ EOF
 chmod +x ~/.local/bin/endfield-dump
 ```
 
+**Windows (PowerShell, as Admin):**
+```powershell
+# Create a wrapper batch file in a PATH directory
+@'
+@echo off
+dotnet "C:\path\to\AnimeStudio\AnimeStudio.Endfield.Cli\bin\Release\net9.0\endfield-dump.dll" %*
+'@ | Set-Content "$env:ProgramFiles\endfield-dump\endfield-dump.cmd"
+```
+
+Or add the DLL directory to PATH and run directly:
+```powershell
+$env:PATH += ";C:\path\to\AnimeStudio\AnimeStudio.Endfield.Cli\bin\Release\net9.0"
+dotnet endfield-dump.dll extract --vfs .\StreamingAssets --out .\out --exclude-material --classify --threads 16
+```
+
 ## Usage
+
+> **Linux** examples use `endfield-dump` (if installed) or `dotnet endfield-dump.dll`.
+> **Windows** examples use `dotnet endfield-dump.dll` (adjust path as needed).
 
 ### List all BlockTypes
 
 ```bash
+# Linux
 endfield-dump list --vfs ./StreamingAssets
+```
+```powershell
+# Windows
+dotnet endfield-dump.dll list --vfs .\StreamingAssets
 ```
 
 ### Extract character art (with classification)
 
 ```bash
+# Linux
 endfield-dump extract \
     --vfs ./StreamingAssets \
     --out ./out \
@@ -148,6 +235,18 @@ endfield-dump extract \
     --threads 16 \
     --format png \
     --png-compression fast \
+    --max-memory-gb 64
+```
+```powershell
+# Windows
+dotnet endfield-dump.dll extract `
+    --vfs .\StreamingAssets `
+    --out .\out `
+    --exclude-material `
+    --classify `
+    --threads 16 `
+    --format png `
+    --png-compression fast `
     --max-memory-gb 64
 ```
 
@@ -307,4 +406,4 @@ End-to-end image extract: ~70× faster than upstream (524s vs ~10 hours estimate
 
 - **AnimationClip export**: parsing works, but Endfield uses ACL-compressed buffers (`0xac11ac11` magic) for actual keyframe data. AnimeStudio only reads the raw bytes; full ACL decompression is not implemented. Exported metadata-only JSON is not useful without keyframes.
 - **Mesh export**: not implemented.
-- **Windows builds**: untested (uses Linux-specific Texture2DDecoder and /dev/shm paths).
+- **Windows builds**: supported (Texture2DDecoder.Windows + Ooz.dll are included). Audio/video pipelines need Windows builds of vgmstream-cli and ffmpeg. macOS untested.
