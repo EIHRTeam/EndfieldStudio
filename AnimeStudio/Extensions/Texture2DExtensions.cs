@@ -58,7 +58,8 @@ namespace AnimeStudio
                 return null;
             }
             long pixelCount = (long)m_Texture2D.m_Width * m_Texture2D.m_Height;
-            const long MaxPixels = 1L << 30;  // 1 billion pixels ≈ 4 GB BGRA buffer，已超合理上限
+            // MaxPixels 必须 < int.MaxValue / 4 = 536870911，因为 ArrayPool.Rent(min(int, w*h*4))
+            const long MaxPixels = 500_000_000L;  // 500M pixels ≈ 2 GB BGRA buffer，安全上限
             if (pixelCount > MaxPixels)
             {
                 Logger.Warning($"Texture2D pixel count too large: {m_Texture2D.m_Width}x{m_Texture2D.m_Height} = {pixelCount:N0}, skipping");

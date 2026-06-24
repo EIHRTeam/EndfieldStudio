@@ -781,7 +781,7 @@ internal static class Program
                             else
                             {
                                 // 未映射的文件：跳过不导出
-                                Interlocked.Increment(ref localSkipped);
+                                Interlocked.Increment(ref localUnmapped);
                                 return;
                             }
 
@@ -1292,7 +1292,7 @@ internal static class Program
         Directory.CreateDirectory(outDir);
         var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
         long allocThresholdBytes = allocThresholdMb * 1024L * 1024L;
-        string scratch = "/dev/shm/efend-bad-scan";
+        string scratch = Path.Combine(Path.GetTempPath(), "efend-bad-scan");
         Directory.CreateDirectory(scratch);
 
         var allFiles = new List<(BlockType bt, ChunkInfo chunk, AnimeStudio.Endfield.FileInfo file)>();
@@ -1362,10 +1362,8 @@ internal static class Program
                 if (allFull)
                 {
                     Console.WriteLine($"All 9 buckets filled, stopping.");
-                    scanned++;
                     break;
                 }
-                scanned++;
                 continue;
             }
 
@@ -1509,7 +1507,7 @@ internal static class Program
         int good = 0, bad = 0, error = 0;
         var sw = Stopwatch.StartNew();
 
-        string scratch = "/dev/shm/efend-classify";
+        string scratch = Path.Combine(Path.GetTempPath(), "efend-classify");
         Directory.CreateDirectory(scratch);
 
         foreach (var (bt, chunk, file) in allFiles)
@@ -1923,7 +1921,7 @@ internal static class Program
         if (vfsPath is null) throw new ArgumentException("--vfs is required");
         if (blocks.Count == 0) blocks.Add(BlockType.Bundle);
 
-        string scratch = "/dev/shm/efend-inspect";
+        string scratch = Path.Combine(Path.GetTempPath(), "efend-inspect");
         if (Directory.Exists(scratch)) Directory.Delete(scratch, recursive: true);
         Directory.CreateDirectory(scratch);
 
@@ -2038,7 +2036,7 @@ internal static class Program
         int threads = 0;
         int limit = 0;
         long minSize = 0;
-        string scratch = "/dev/shm/efend-bundles";
+        string scratch = Path.Combine(Path.GetTempPath(), "efend-bundles");
         bool keepBundles = false;
         string format = "png";          // png | bmp | tga
         string pngCompression = "none"; // none | fast | default
