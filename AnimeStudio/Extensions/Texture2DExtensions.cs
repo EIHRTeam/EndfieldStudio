@@ -1,4 +1,4 @@
-﻿using SixLabors.ImageSharp;
+using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
@@ -48,6 +48,23 @@ namespace AnimeStudio
 
         public static Image<Bgra32> ConvertToImage(this Texture2D m_Texture2D, bool flip)
         {
+            // Sanity check: width/height 可能是损坏字段（垃圾值几百万），
+            // 直接相乘会 overflow 成几十 GB → ArrayPool.Rent → OOM
+            const int MaxTextureDim = 1 << 15;  // 32768，覆盖所有合理 Unity 纹理上限
+            if (m_Texture2D.m_Width <= 0 || m_Texture2D.m_Height <= 0 ||
+                m_Texture2D.m_Width > MaxTextureDim || m_Texture2D.m_Height > MaxTextureDim)
+            {
+                Logger.Warning($"Texture2D dimensions out of range: {m_Texture2D.m_Width}x{m_Texture2D.m_Height}, skipping");
+                return null;
+            }
+            long pixelCount = (long)m_Texture2D.m_Width * m_Texture2D.m_Height;
+            const long MaxPixels = 1L << 30;  // 1 billion pixels ≈ 4 GB BGRA buffer，已超合理上限
+            if (pixelCount > MaxPixels)
+            {
+                Logger.Warning($"Texture2D pixel count too large: {m_Texture2D.m_Width}x{m_Texture2D.m_Height} = {pixelCount:N0}, skipping");
+                return null;
+            }
+
             var converter = new Texture2DConverter(m_Texture2D);
             byte[] buff = ArrayPool<byte>.Shared.Rent(m_Texture2D.m_Width * m_Texture2D.m_Height * 4);
             try

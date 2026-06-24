@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
@@ -34,6 +34,18 @@ namespace AnimeStudio
         public List<SerializedType> m_RefTypes;
         public string userInformation;
 
+        // 分配预算检查：在解析循环中周期性检查线程分配量，超限立即抛异常
+        private long _allocBudgetStart;
+
+        private void CheckAllocBudget()
+        {
+            long budget = assetsManager?.PerFileAllocBudgetBytes ?? 0;
+            if (budget <= 0 || _allocBudgetStart == 0) return;
+            long delta = GC.GetAllocatedBytesForCurrentThread() - _allocBudgetStart;
+            if (delta > budget)
+                throw new AllocBudgetExceededException(delta, budget, fileName);
+        }
+
         public SerializedFile(FileReader reader, AssetsManager assetsManager)
         {
             this.assetsManager = assetsManager;
@@ -41,6 +53,9 @@ namespace AnimeStudio
             game = assetsManager.Game;
             fullName = reader.FullPath;
             fileName = reader.FileName;
+
+            _allocBudgetStart = (assetsManager.PerFileAllocBudgetBytes > 0)
+                ? GC.GetAllocatedBytesForCurrentThread() : 0;
 
             // ReadHeader
             header = new SerializedFileHeader();
@@ -106,11 +121,15 @@ namespace AnimeStudio
 
             // Read Types
             int typeCount = reader.ReadInt32();
+            // Sanity check: 合法 Unity bundle 不会有上百万 type（损坏数据会读出 2 亿）
+            if (typeCount < 0 || typeCount > 100_000)
+                throw new IOException($"SerializedFile typeCount out of range: {typeCount:N0} (file may be corrupted)");
             m_Types = new List<SerializedType>();
             Logger.Verbose($"Found {typeCount} serialized types");
             for (int i = 0; i < typeCount; i++)
             {
                 m_Types.Add(ReadSerializedType(false));
+                if ((i & 0x3F) == 0) CheckAllocBudget();
             }
 
             if (header.m_Version >= SerializedFileFormatVersion.Unknown_7 && header.m_Version < SerializedFileFormatVersion.Unknown_14)
@@ -120,9 +139,14 @@ namespace AnimeStudio
 
             // Read Objects
             int objectCount = reader.ReadInt32();
+            // Sanity check: 同上，防止垃圾数据触发超大 List 扩容 → OOM
+            if (objectCount < 0 || objectCount > 1_000_000)
+                throw new IOException($"SerializedFile objectCount out of range: {objectCount:N0} (file may be corrupted)");
             m_Objects = new List<ObjectInfo>();
             Objects = new List<Object>();
             ObjectsDic = new Dictionary<long, Object>();
+            // 预分配三个集合本身就是大量内存——在分配前先检查预算
+            CheckAllocBudget();
             Logger.Verbose($"Found {objectCount} objects");
             for (int i = 0; i < objectCount; i++)
             {
@@ -176,11 +200,14 @@ namespace AnimeStudio
                 }
                 Logger.Verbose($"Object Info: {objectInfo}");
                 m_Objects.Add(objectInfo);
+                if ((i & 0xFF) == 0) CheckAllocBudget();
             }
 
             if (header.m_Version >= SerializedFileFormatVersion.HasScriptTypeIndex)
             {
                 int scriptCount = reader.ReadInt32();
+                if (scriptCount < 0 || scriptCount > 1_000_000)
+                    throw new IOException($"SerializedFile scriptCount out of range: {scriptCount:N0} (file may be corrupted)");
                 Logger.Verbose($"Found {scriptCount} scripts");
                 m_ScriptTypes = new List<LocalSerializedObjectIdentifier>();
                 for (int i = 0; i < scriptCount; i++)
@@ -202,6 +229,8 @@ namespace AnimeStudio
             }
 
             int externalsCount = reader.ReadInt32();
+            if (externalsCount < 0 || externalsCount > 100_000)
+                throw new IOException($"SerializedFile externalsCount out of range: {externalsCount:N0} (file may be corrupted)");
             m_Externals = new List<FileIdentifier>();
             Logger.Verbose($"Found {externalsCount} externals");
             for (int i = 0; i < externalsCount; i++)
@@ -225,6 +254,8 @@ namespace AnimeStudio
             if (header.m_Version >= SerializedFileFormatVersion.SupportsRefObject)
             {
                 int refTypesCount = reader.ReadInt32();
+                if (refTypesCount < 0 || refTypesCount > 100_000)
+                    throw new IOException($"SerializedFile refTypesCount out of range: {refTypesCount:N0} (file may be corrupted)");
                 m_RefTypes = new List<SerializedType>();
                 Logger.Verbose($"Found {refTypesCount} reference types");
                 for (int i = 0; i < refTypesCount; i++)
@@ -323,6 +354,11 @@ namespace AnimeStudio
 
         private void ReadTypeTree(TypeTree m_Type, int level = 0)
         {
+            // 防止损坏数据导致无限递归 → stack overflow + OOM
+            if (level > 1000)
+                throw new IOException("ReadTypeTree recursion too deep (>1000), data likely corrupted");
+            // 每次递归都检查分配预算
+            CheckAllocBudget();
             Logger.Verbose($"Attempting to parse type tree...");
             var typeTreeNode = new TypeTreeNode();
             m_Type.m_Nodes.Add(typeTreeNode);
@@ -346,6 +382,8 @@ namespace AnimeStudio
             }
 
             int childrenCount = reader.ReadInt32();
+            if (childrenCount < 0 || childrenCount > 10000)
+                throw new IOException($"ReadTypeTree childrenCount out of range: {childrenCount} (data likely corrupted)");
             for (int i = 0; i < childrenCount; i++)
             {
                 ReadTypeTree(m_Type, level + 1);
@@ -359,7 +397,13 @@ namespace AnimeStudio
             Logger.Verbose($"Attempting to parse blob type tree...");
             int numberOfNodes = reader.ReadInt32();
             int stringBufferSize = reader.ReadInt32();
+            if (numberOfNodes < 0 || numberOfNodes > 100_000)
+                throw new IOException($"TypeTreeBlobRead numberOfNodes out of range: {numberOfNodes} (data likely corrupted)");
+            if (stringBufferSize < 0 || stringBufferSize > 10_000_000)
+                throw new IOException($"TypeTreeBlobRead stringBufferSize out of range: {stringBufferSize} (data likely corrupted)");
             Logger.Verbose($"Found {numberOfNodes} nodes and {stringBufferSize} strings");
+            // 在批量分配前检查预算
+            CheckAllocBudget();
             for (int i = 0; i < numberOfNodes; i++)
             {
                 var typeTreeNode = new TypeTreeNode();
@@ -376,8 +420,11 @@ namespace AnimeStudio
                 {
                     typeTreeNode.m_RefTypeHash = reader.ReadUInt64();
                 }
+                if ((i & 0x3F) == 0) CheckAllocBudget();
             }
             m_Type.m_StringBuffer = reader.ReadBytes(stringBufferSize);
+            // ReadBytes(stringBufferSize) 可能分配最多 10MB——分配后再检查一次
+            CheckAllocBudget();
 
             using (var stringBufferReader = new EndianBinaryReader(new MemoryStream(m_Type.m_StringBuffer), EndianType.LittleEndian))
             {

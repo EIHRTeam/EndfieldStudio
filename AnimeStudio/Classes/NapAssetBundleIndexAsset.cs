@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -19,24 +19,24 @@ namespace AnimeStudio
 
         public NapAssetBundleIndexAsset(ObjectReader reader) : base(reader)
         {
-            var m_AssetArraySize = reader.ReadInt32();
+            var m_AssetArraySize = reader.ReadInt32Clamped(1_000_000);
             m_AssetArray = new List<IndexAssetRef>(m_AssetArraySize);
             for (int i = 0; i < m_AssetArraySize; i++)
                 m_AssetArray.Add(new IndexAssetRef(reader));
 
-            var m_BundleArraySize = reader.ReadInt32();
+            var m_BundleArraySize = reader.ReadInt32Clamped(1_000_000);
             m_BundleArray = new List<IndexBundleRef>(m_BundleArraySize);
             for (int i = 0; i < m_BundleArraySize; i++)
                 m_BundleArray.Add(new IndexBundleRef(reader));
 
-            var m_BlockArraySize = reader.ReadInt32();
+            var m_BlockArraySize = reader.ReadInt32Clamped(1_000_000);
             m_BlockArray = new List<IndexBlockRef>(m_BlockArraySize);
             for (int i = 0; i < m_BlockArraySize; i++)
                 m_BlockArray.Add(new IndexBlockRef(reader));
 
             reader.AlignStream();
 
-            var m_ChildrenIndexArraySize = reader.ReadInt32();
+            var m_ChildrenIndexArraySize = reader.ReadInt32Clamped(1_000_000);
             m_ChildrenIndexArray = new List<uint>(m_ChildrenIndexArraySize);
             for (int i = 0; i < m_ChildrenIndexArraySize; i++)
                 m_ChildrenIndexArray.Add(reader.ReadUInt32());

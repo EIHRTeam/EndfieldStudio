@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -33,7 +33,7 @@ namespace AnimeStudio
                     reader.Position += 8;
                 }
                 var m_PixelScale = reader.ReadSingle();
-                int m_FontData_size = reader.ReadInt32();
+                int m_FontData_size = reader.ReadInt32Clamped(100_000_000);
                 if (m_FontData_size > 0)
                 {
                     m_FontData = reader.ReadBytes(m_FontData_size);
@@ -110,7 +110,7 @@ namespace AnimeStudio
                 }
                 else { float m_PixelScale = reader.ReadSingle(); }
 
-                int m_FontData_size = reader.ReadInt32();
+                int m_FontData_size = reader.ReadInt32Clamped(100_000_000);
                 if (m_FontData_size > 0)
                 {
                     m_FontData = reader.ReadBytes(m_FontData_size);

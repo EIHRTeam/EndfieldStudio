@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace AnimeStudio
 {
@@ -171,7 +171,7 @@ namespace AnimeStudio
                 var m_PlatformBlob = reader.ReadUInt8Array();
                 reader.AlignStream();
             }
-            var image_data_size = reader.ReadInt32();
+            var image_data_size = reader.ReadInt32Clamped(100_000_000);
             if (image_data_size == 0 && ((version[0] == 5 && version[1] >= 3) || version[0] > 5))//5.3.0 and up
             {
                 if (reader.Game.Type.IsGI() && HasExternalMipRelativeOffset(reader.serializedType))

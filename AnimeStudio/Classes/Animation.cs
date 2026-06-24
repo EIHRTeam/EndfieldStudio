@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -12,7 +12,7 @@ namespace AnimeStudio
         public Animation(ObjectReader reader) : base(reader)
         {
             var m_Animation = new PPtr<AnimationClip>(reader);
-            int numAnimations = reader.ReadInt32();
+            int numAnimations = reader.ReadInt32Clamped(1_000_000);
             m_Animations = new List<PPtr<AnimationClip>>();
             for (int i = 0; i < numAnimations; i++)
             {

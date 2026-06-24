@@ -15,8 +15,14 @@ namespace AnimeStudio
         public Game Game;
         public bool Silent = false;
         public bool SkipProcess = false;
-        public bool ResolveDependencies = false;        
+        public bool ResolveDependencies = false;
         public string SpecifyUnityVersion;
+        /// <summary>
+        /// 单个 SerializedFile 解析时的线程分配预算（字节）。0 = 不限制。
+        /// 在 SerializedFile 构造函数的关键解析循环中周期性检查，
+        /// 超过就抛 IOException，从 LoadFiles 内部中断——避免分配 15GB 后才兜底。
+        /// </summary>
+        public long PerFileAllocBudgetBytes = 0;
         public CancellationTokenSource tokenSource = new CancellationTokenSource();
         public List<SerializedFile> assetsFileList = new List<SerializedFile>();
 
@@ -134,8 +140,28 @@ namespace AnimeStudio
 
             if (!SkipProcess)
             {
+                long allocBeforeRA = PerFileAllocBudgetBytes > 0
+                    ? GC.GetAllocatedBytesForCurrentThread() : 0;
                 ReadAssets();
+                if (allocBeforeRA > 0)
+                {
+                    long deltaRA = GC.GetAllocatedBytesForCurrentThread() - allocBeforeRA;
+                    if (deltaRA > PerFileAllocBudgetBytes / 4)
+                        Logger.Verbose($"[ALLOC-TRACE] ReadAssets done, delta={deltaRA / 1024 / 1024}MB");
+                    if (deltaRA > PerFileAllocBudgetBytes)
+                        throw new AllocBudgetExceededException(deltaRA, PerFileAllocBudgetBytes, "ReadAssets");
+                }
+                long allocBeforePA = PerFileAllocBudgetBytes > 0
+                    ? GC.GetAllocatedBytesForCurrentThread() : 0;
                 ProcessAssets();
+                if (allocBeforePA > 0)
+                {
+                    long deltaPA = GC.GetAllocatedBytesForCurrentThread() - allocBeforePA;
+                    if (deltaPA > PerFileAllocBudgetBytes / 4)
+                        Logger.Verbose($"[ALLOC-TRACE] ProcessAssets done, delta={deltaPA / 1024 / 1024}MB");
+                    if (deltaPA > PerFileAllocBudgetBytes)
+                        throw new AllocBudgetExceededException(deltaPA, PerFileAllocBudgetBytes, "ProcessAssets");
+                }
             }
         }
 
@@ -275,9 +301,20 @@ namespace AnimeStudio
             Logger.Verbose($"Loading asset file {reader.FileName} with version {unityVersion} from {originalPath} at offset 0x{originalOffset:X8}");
             if (!assetsFileListHash.Contains(reader.FileName))
             {
+                long allocBefore = PerFileAllocBudgetBytes > 0
+                    ? GC.GetAllocatedBytesForCurrentThread() : 0;
                 try
                 {
                     var assetsFile = new SerializedFile(reader, this);
+                    // SerializedFile 构造后立即检查（仅异常时打日志）
+                    if (allocBefore > 0)
+                    {
+                        long delta = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+                        if (delta > PerFileAllocBudgetBytes / 4)
+                            Logger.Verbose($"[ALLOC-TRACE] SerializedFile({reader.FileName}) delta={delta / 1024 / 1024}MB");
+                        if (delta > PerFileAllocBudgetBytes)
+                            throw new AllocBudgetExceededException(delta, PerFileAllocBudgetBytes, reader.FileName);
+                    }
                     assetsFile.originalPath = originalPath;
                     assetsFile.offset = originalOffset;
                     if (!string.IsNullOrEmpty(unityVersion) && assetsFile.header.m_Version < SerializedFileFormatVersion.Unknown_7)
@@ -288,6 +325,11 @@ namespace AnimeStudio
                     assetsFileList.Add(assetsFile);
                     assetsFileIndexCache.Add(assetsFile.fileName, assetsFileList.Count - 1);
                     assetsFileListHash.Add(assetsFile.fileName);
+                }
+                catch (AllocBudgetExceededException)
+                {
+                    // 必须穿透
+                    throw;
                 }
                 catch (Exception e)
                 {
@@ -499,6 +541,8 @@ namespace AnimeStudio
             {
                 Logger.Info("Loading " + reader.FullPath);
             }
+            long allocStart = (PerFileAllocBudgetBytes > 0)
+                ? GC.GetAllocatedBytesForCurrentThread() : 0;
             try
             {
                 dynamic file = null;
@@ -523,8 +567,27 @@ namespace AnimeStudio
                         break;
                 }
 
+                // 容器解析后立即检查 + 日志
+                if (allocStart > 0)
+                {
+                    long delta = GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                    Logger.Verbose($"[ALLOC-TRACE] Container({reader.FileType}) constructed, fileList.Count={file?.fileList?.Count ?? 0}, delta={delta / 1024 / 1024}MB");
+                    if (delta > PerFileAllocBudgetBytes)
+                        throw new AllocBudgetExceededException(delta, PerFileAllocBudgetBytes, reader.FileName);
+                }
+
                 if (file == null)
                     throw new Exception("Unsupported game block file type");
+
+                // 容器解析后立即检查 + 日志（仅在异常时打印，避免刷屏）
+                if (allocStart > 0)
+                {
+                    long delta = GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                    if (delta > PerFileAllocBudgetBytes / 4)
+                        Logger.Verbose($"[ALLOC-TRACE] Container({reader.FileType}) fileList.Count={file?.fileList?.Count ?? 0} delta={delta / 1024 / 1024}MB");
+                    if (delta > PerFileAllocBudgetBytes)
+                        throw new AllocBudgetExceededException(delta, PerFileAllocBudgetBytes, reader.FileName);
+                }
 
                 Logger.Verbose($"file total size: {file.m_Header.size:X8}");
                 foreach (var innerFile in file.fileList)
@@ -540,7 +603,19 @@ namespace AnimeStudio
                         Logger.Verbose("Caching resource stream");
                         resourceFileReaders.TryAdd(innerFile.fileName, cabReader); //TODO
                     }
+                    // 每个 inner file 解析后检查分配量
+                    if (allocStart > 0)
+                    {
+                        long delta = GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                        if (delta > PerFileAllocBudgetBytes)
+                            throw new AllocBudgetExceededException(delta, PerFileAllocBudgetBytes, reader.FileName);
+                    }
                 }
+            }
+            catch (AllocBudgetExceededException)
+            {
+                // 预算超限异常必须穿透——不能被下面的 catch-all 吞掉
+                throw;
             }
             catch (InvalidCastException)
             {
@@ -626,6 +701,8 @@ namespace AnimeStudio
 
             var progressCount = assetsFileList.Sum(x => x.m_Objects.Count);
             int i = 0;
+            long allocStart = (PerFileAllocBudgetBytes > 0)
+                ? GC.GetAllocatedBytesForCurrentThread() : 0;
             Progress.Reset();
             foreach (var assetsFile in assetsFileList)
             {
@@ -635,6 +712,13 @@ namespace AnimeStudio
                     {
                         Logger.Info("Reading assets has been cancelled !!");
                         return;
+                    }
+                    // 分配预算检查：每个 object 都检查（GC 计数器读取极快）
+                    if (allocStart > 0)
+                    {
+                        long delta = GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                        if (delta > PerFileAllocBudgetBytes)
+                            throw new AllocBudgetExceededException(delta, PerFileAllocBudgetBytes, assetsFile.fileName);
                     }
                     var objectReader = new ObjectReader(assetsFile.reader, assetsFile, objectInfo, Game);
                     try
@@ -674,10 +758,33 @@ namespace AnimeStudio
                             ClassIDType.NapAssetBundleIndexAsset when ClassIDType.NapAssetBundleIndexAsset.CanParse() => new NapAssetBundleIndexAsset(objectReader),
                             _ => new Object(objectReader),
                         };
+                        // 每个 Object 构造后立即检查累积分配量（不是单 object 增量）
+                        if (allocStart > 0)
+                        {
+                            long cumDelta = GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                            if (cumDelta > PerFileAllocBudgetBytes)
+                                throw new AllocBudgetExceededException(
+                                    cumDelta,
+                                    PerFileAllocBudgetBytes,
+                                    $"{assetsFile.fileName} [{objectReader.type} PathID={objectInfo.m_PathID}]");
+                        }
                         assetsFile.AddObject(obj);
+                    }
+                    catch (AllocBudgetExceededException)
+                    {
+                        throw;
                     }
                     catch (Exception e)
                     {
+                        // Object 构造器可能在分配大量内存后抛异常——检查累积分配量
+                        if (allocStart > 0)
+                        {
+                            long delta = GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                            if (delta > PerFileAllocBudgetBytes)
+                                throw new AllocBudgetExceededException(
+                                    delta, PerFileAllocBudgetBytes,
+                                    $"{assetsFile.fileName} [{objectReader.type} PathID={objectInfo.m_PathID}] (ctor threw: {e.GetType().Name})");
+                        }
                         var sb = new StringBuilder();
                         sb.AppendLine("Unable to load object")
                             .AppendLine($"Assets {assetsFile.fileName}")

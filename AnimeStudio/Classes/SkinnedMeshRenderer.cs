@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -37,7 +37,7 @@ namespace AnimeStudio
 
             m_Mesh = new PPtr<Mesh>(reader);
 
-            var numBones = reader.ReadInt32();
+            var numBones = reader.ReadInt32Clamped(1_000_000);
             m_Bones = new List<PPtr<Transform>>();
             for (int b = 0; b < numBones; b++)
             {

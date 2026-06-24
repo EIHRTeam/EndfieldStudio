@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -26,7 +26,7 @@ namespace AnimeStudio
         {
             m_Controller = new PPtr<RuntimeAnimatorController>(reader);
 
-            int numOverrides = reader.ReadInt32();
+            int numOverrides = reader.ReadInt32Clamped(1_000_000);
             m_Clips = new List<AnimationClipOverride>();
             for (int i = 0; i < numOverrides; i++)
             {

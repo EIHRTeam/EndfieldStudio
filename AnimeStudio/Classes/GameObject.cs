@@ -1,4 +1,4 @@
-﻿using AnimeStudio;
+using AnimeStudio;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.Metrics;
@@ -22,7 +22,7 @@ namespace AnimeStudio
         public override string Name => m_Name;
         public GameObject(ObjectReader reader) : base(reader)
         {
-            int m_Component_size = reader.ReadInt32();
+            int m_Component_size = reader.ReadInt32Clamped(1_000_000);
             m_Components = new List<PPtr<Component>>();
             for (int i = 0; i < m_Component_size; i++)
             {

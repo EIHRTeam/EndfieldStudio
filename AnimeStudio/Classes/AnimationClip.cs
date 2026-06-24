@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -125,7 +125,7 @@ namespace AnimeStudio
         public AnimationCurve(ObjectReader reader, Func<T> readerFunc, int type = 0)
         {
             var version = reader.version;
-            int numCurves = reader.ReadInt32();
+            int numCurves = reader.ReadInt32Clamped(1_000_000);
             m_Curve = new List<Keyframe<T>>();
             for (int i = 0; i < numCurves; i++)
             {
@@ -151,7 +151,7 @@ namespace AnimeStudio
                     var m_IsBitCompress = reader.ReadBoolean();
 
                     var m_MetaData = new List<CompressMetaData1>();
-                    var m_MetaDataCount = reader.ReadInt32();
+                    var m_MetaDataCount = reader.ReadInt32Clamped(1_000_000);
                     for (int i = 0; (i < m_MetaDataCount); i++)
                     {
                         m_MetaData.Add(new CompressMetaData1(reader));
@@ -159,7 +159,7 @@ namespace AnimeStudio
                 } else if (type == 2)
                 {
                     var m_MetaData = new List<CompressMetaData2>();
-                    var m_MetaDataCount = reader.ReadInt32();
+                    var m_MetaDataCount = reader.ReadInt32Clamped(1_000_000);
                     for (int i = 0; (i < m_MetaDataCount); i++)
                     {
                         m_MetaData.Add(new CompressMetaData2(reader));
@@ -250,7 +250,7 @@ namespace AnimeStudio
             m_Range = reader.ReadSingle();
             m_Start = reader.ReadSingle();
 
-            int numData = reader.ReadInt32();
+            int numData = reader.ReadInt32Clamped(100_000_000);
             m_Data = reader.ReadBytes(numData);
             reader.AlignStream();
 
@@ -318,7 +318,7 @@ namespace AnimeStudio
         {
             m_NumItems = reader.ReadUInt32();
 
-            int numData = reader.ReadInt32();
+            int numData = reader.ReadInt32Clamped(100_000_000);
             m_Data = reader.ReadBytes(numData);
             reader.AlignStream();
 
@@ -370,7 +370,7 @@ namespace AnimeStudio
         {
             m_NumItems = reader.ReadUInt32();
 
-            int numData = reader.ReadInt32();
+            int numData = reader.ReadInt32Clamped(100_000_000);
             m_Data = reader.ReadBytes(numData);
 
             reader.AlignStream();
@@ -643,7 +643,7 @@ namespace AnimeStudio
         {
             var version = reader.version;
 
-            int numCurves = reader.ReadInt32();
+            int numCurves = reader.ReadInt32Clamped(1_000_000);
             curve = new List<PPtrKeyframe>();
             for (int i = 0; i < numCurves; i++)
             {
@@ -810,7 +810,7 @@ namespace AnimeStudio
             m_LookAtPosition = version[0] > 5 || (version[0] == 5 && version[1] >= 4) ? reader.ReadVector3() : (Vector3)reader.ReadVector4();//5.4 and up
             m_LookAtWeight = reader.ReadVector4();
 
-            int numGoals = reader.ReadInt32();
+            int numGoals = reader.ReadInt32Clamped(1_000_000);
             m_GoalArray = new List<HumanGoal>();
             for (int i = 0; i < numGoals; i++)
             {
@@ -888,7 +888,7 @@ namespace AnimeStudio
         }
         public override void Read(ObjectReader reader)
         {
-            var byteCount = reader.ReadInt32();
+            var byteCount = reader.ReadInt32Clamped(100_000_000);
 
             if (reader.Game.Type.IsSRGroup())
             {
@@ -940,12 +940,12 @@ namespace AnimeStudio
             var aclTransformCount = reader.ReadUInt32();
             var aclScalarCount = reader.ReadUInt32();
 
-            var compressedTransformTracksCount = reader.ReadInt32() * 0x10;
+            var compressedTransformTracksCount = reader.ReadInt32Clamped(100_000_000) * 0x10;
             var compressedTransformTracks = reader.ReadBytes(compressedTransformTracksCount);
-            var compressedScalarTracksCount = reader.ReadInt32() * 0x10;
+            var compressedScalarTracksCount = reader.ReadInt32Clamped(100_000_000) * 0x10;
             var compressedScalarTracks = reader.ReadBytes(compressedScalarTracksCount);
 
-            int numaclTransformTrackIDToBindingCurveID = reader.ReadInt32();
+            int numaclTransformTrackIDToBindingCurveID = reader.ReadInt32Clamped(1_000_000);
             var aclTransformTrackIDToBindingCurveID = new List<AclTransformTrackIDToBindingCurveID>();
             for (int i = 0; i < numaclTransformTrackIDToBindingCurveID; i++)
             {
@@ -1102,7 +1102,7 @@ namespace AnimeStudio
             {
                 time = reader.ReadSingle();
 
-                int numKeys = reader.ReadInt32();
+                int numKeys = reader.ReadInt32Clamped(10_000_000);
                 keyList = new List<StreamedCurveKey>();
                 for (int i = 0; i < numKeys; i++)
                 {
@@ -1365,7 +1365,7 @@ namespace AnimeStudio
 
         public ValueArrayConstant(ObjectReader reader)
         {
-            int numVals = reader.ReadInt32();
+            int numVals = reader.ReadInt32Clamped(10_000_000);
             m_ValueArray = new List<ValueConstant>();
             for (int i = 0; i < numVals; i++)
             {
@@ -1586,7 +1586,7 @@ namespace AnimeStudio
             {
                 var m_AdditionalCurveIndexArray = reader.ReadInt32Array();
             }
-            int numDeltas = reader.ReadInt32();
+            int numDeltas = reader.ReadInt32Clamped(10_000_000);
             m_ValueArrayDelta = new List<ValueDelta>();
             for (int i = 0; i < numDeltas; i++)
             {
@@ -1857,14 +1857,14 @@ namespace AnimeStudio
 
         public AnimationClipBindingConstant(ObjectReader reader)
         {
-            int numBindings = reader.ReadInt32();
+            int numBindings = reader.ReadInt32Clamped(1_000_000);
             genericBindings = new List<GenericBinding>();
             for (int i = 0; i < numBindings; i++)
             {
                 genericBindings.Add(new GenericBinding(reader));
             }
 
-            int numMappings = reader.ReadInt32();
+            int numMappings = reader.ReadInt32Clamped(1_000_000);
             pptrCurveMapping = new List<PPtr<Object>>();
             for (int i = 0; i < numMappings; i++)
             {
@@ -2038,7 +2038,7 @@ namespace AnimeStudio
                 reader.AlignStream();
                 var m_aclTransformCache = reader.ReadUInt8Array();
                 var m_aclScalarCache = reader.ReadUInt8Array();
-                int numaclTransformTrackId2CurveId = reader.ReadInt32();
+                int numaclTransformTrackId2CurveId = reader.ReadInt32Clamped(1_000_000);
                 var m_aclTransformTrackId2CurveId = new List<AclTransformTrackIDToBindingCurveID>();
                 for (int i = 0; i < numaclTransformTrackId2CurveId; i++)
                 {
@@ -2056,14 +2056,14 @@ namespace AnimeStudio
                 m_UseHighQualityCurve = reader.ReadBoolean();
             }
             reader.AlignStream();
-            int numRCurves = reader.ReadInt32();
+            int numRCurves = reader.ReadInt32Clamped(1_000_000);
             m_RotationCurves = new List<QuaternionCurve>();
             for (int i = 0; i < numRCurves; i++)
             {
                 m_RotationCurves.Add(new QuaternionCurve(reader));
             }
 
-            int numCRCurves = reader.ReadInt32();
+            int numCRCurves = reader.ReadInt32Clamped(1_000_000);
             m_CompressedRotationCurves = new List<CompressedAnimationCurve>();
             for (int i = 0; i < numCRCurves; i++)
             {
@@ -2077,7 +2077,7 @@ namespace AnimeStudio
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 3))//5.3 and up
             {
-                int numEulerCurves = reader.ReadInt32();
+                int numEulerCurves = reader.ReadInt32Clamped(1_000_000);
                 m_EulerCurves = new List<Vector3Curve>();
                 for (int i = 0; i < numEulerCurves; i++)
                 {
@@ -2085,21 +2085,21 @@ namespace AnimeStudio
                 }
             }
 
-            int numPCurves = reader.ReadInt32();
+            int numPCurves = reader.ReadInt32Clamped(1_000_000);
             m_PositionCurves = new List<Vector3Curve>();
             for (int i = 0; i < numPCurves; i++)
             {
                 m_PositionCurves.Add(new Vector3Curve(reader));
             }
 
-            int numSCurves = reader.ReadInt32();
+            int numSCurves = reader.ReadInt32Clamped(1_000_000);
             m_ScaleCurves = new List<Vector3Curve>();
             for (int i = 0; i < numSCurves; i++)
             {
                 m_ScaleCurves.Add(new Vector3Curve(reader));
             }
 
-            int numFCurves = reader.ReadInt32();
+            int numFCurves = reader.ReadInt32Clamped(1_000_000);
             m_FloatCurves = new List<FloatCurve>();
             for (int i = 0; i < numFCurves; i++)
             {
@@ -2108,7 +2108,7 @@ namespace AnimeStudio
 
             if (version[0] > 4 || (version[0] == 4 && version[1] >= 3)) //4.3 and up
             {
-                int numPtrCurves = reader.ReadInt32();
+                int numPtrCurves = reader.ReadInt32Clamped(1_000_000);
                 m_PPtrCurves = new List<PPtrCurve>();
                 for (int i = 0; i < numPtrCurves; i++)
                 {
@@ -2154,7 +2154,7 @@ namespace AnimeStudio
             if (reader.Game.Type.IsSRGroup())
             {
                 var m_AclClipData = reader.ReadUInt8Array();
-                var aclBindingsCount = reader.ReadInt32();
+                var aclBindingsCount = reader.ReadInt32Clamped(1_000_000);
                 var m_AclBindings = new List<GenericBinding>();
                 for (int i = 0; i < aclBindingsCount; i++)
                 {
@@ -2180,7 +2180,7 @@ namespace AnimeStudio
             {
                 var m_AvatarDefaultPose = new TransformInfo(reader);
             }
-            int numEvents = reader.ReadInt32();
+            int numEvents = reader.ReadInt32Clamped(1_000_000);
             m_Events = new List<AnimationEvent>();
             for (int i = 0; i < numEvents; i++)
             {

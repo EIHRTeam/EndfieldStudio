@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -183,7 +183,7 @@ namespace AnimeStudio
             {
                 var m_ViewDistanceRatio = reader.ReadSingle();
             }
-            var m_MaterialsSize = reader.ReadInt32();
+            var m_MaterialsSize = reader.ReadInt32Clamped(1_000_000);
             m_Materials = new List<PPtr<Material>>();
             for (int i = 0; i < m_MaterialsSize; i++)
             {

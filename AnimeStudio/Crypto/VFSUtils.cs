@@ -1,6 +1,7 @@
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Text;
@@ -8,7 +9,7 @@ using System.Threading.Tasks;
 
 namespace AnimeStudio
 {
-    internal class VFSUtils
+    public class VFSUtils
     {
         public static bool IsValidHeader(FileReader reader, GameType game)
         {
@@ -164,6 +165,11 @@ namespace AnimeStudio
 
             Logger.Verbose($"Blocks Count: {blocksCount}");
 
+            // Sanity check: 合法 VFS bundle 的 block 数量通常 1-10，绝不超过几千
+            // 坏 bundle descramble 出来可能是几亿 → 循环分配十几个 GB → OOM
+            if (blocksCount > 10000)
+                throw new IOException($"VFS blocksCount too large: {blocksCount:N0} (likely corrupted/wrong-key bundle)");
+
             List<BundleFile.StorageBlock> blocks = new();
 
             for (int i = 0; i < blocksCount; i++)
@@ -263,6 +269,10 @@ namespace AnimeStudio
             }
 
             Logger.Verbose($"Nodes Count: {nodesCount}");
+
+            // Sanity check: 同 blocksCount，合法值通常 1-5
+            if (nodesCount > 10000)
+                throw new IOException($"VFS nodesCount too large: {nodesCount:N0} (likely corrupted/wrong-key bundle)");
 
             List<BundleFile.Node> nodes = new();
 

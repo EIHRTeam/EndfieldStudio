@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 
@@ -106,7 +106,7 @@ namespace AnimeStudio
 
             if (version[0] >= 2019) //2019 and up
             {
-                var secondaryTexturesSize = reader.ReadInt32();
+                var secondaryTexturesSize = reader.ReadInt32Clamped(1_000_000);
                 secondaryTextures = new List<SecondarySpriteTexture>();
                 for (int i = 0; i < secondaryTexturesSize; i++)
                 {
@@ -116,7 +116,7 @@ namespace AnimeStudio
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
             {
-                var m_SubMeshesSize = reader.ReadInt32();
+                var m_SubMeshesSize = reader.ReadInt32Clamped(1_000_000);
                 m_SubMeshes = new List<SubMesh>();
                 for (int i = 0; i < m_SubMeshesSize; i++)
                 {
@@ -130,7 +130,7 @@ namespace AnimeStudio
             }
             else
             {
-                var verticesSize = reader.ReadInt32();
+                var verticesSize = reader.ReadInt32Clamped(10_000_000);
                 vertices = new List<SpriteVertex>();
                 for (int i = 0; i < verticesSize; i++)
                 {
@@ -147,7 +147,7 @@ namespace AnimeStudio
 
                 if (version[0] == 2018 && version[1] < 2) //2018.2 down
                 {
-                    var m_SourceSkinSize = reader.ReadInt32();
+                    var m_SourceSkinSize = reader.ReadInt32Clamped(10_000_000);
                     for (int i = 0; i < m_SourceSkinSize; i++)
                     {
                         m_SourceSkin[i] = new BoneWeights4(reader);
@@ -246,7 +246,7 @@ namespace AnimeStudio
 
             if (version[0] >= 2017) //2017 and up
             {
-                var m_PhysicsShapeSize = reader.ReadInt32();
+                var m_PhysicsShapeSize = reader.ReadInt32Clamped(10_000_000);
                 m_PhysicsShape = new List<Vector2[]>();
                 for (int i = 0; i < m_PhysicsShapeSize; i++)
                 {
