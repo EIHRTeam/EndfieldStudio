@@ -54,7 +54,7 @@ namespace AnimeStudio
             fullName = reader.FullPath;
             fileName = reader.FileName;
 
-            _allocBudgetStart = (assetsManager.PerFileAllocBudgetBytes > 0)
+            _allocBudgetStart = (assetsManager?.PerFileAllocBudgetBytes > 0)
                 ? GC.GetAllocatedBytesForCurrentThread() : 0;
 
             // ReadHeader
