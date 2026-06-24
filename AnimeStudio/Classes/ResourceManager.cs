@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 
 namespace AnimeStudio
 {
@@ -8,7 +8,7 @@ namespace AnimeStudio
 
         public ResourceManager(ObjectReader reader) : base(reader)
         {
-            var m_ContainerSize = reader.ReadInt32();
+            var m_ContainerSize = reader.ReadInt32Clamped(1_000_000);
             m_Container = new List<KeyValuePair<string, PPtr<Object>>>();
             for (int i = 0; i < m_ContainerSize; i++)
             {

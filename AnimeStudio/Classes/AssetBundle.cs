@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
@@ -32,14 +32,14 @@ namespace AnimeStudio
                 var m_PathFlags = reader.ReadInt32();
             }
 
-            var m_PreloadTableSize = reader.ReadInt32();
+            var m_PreloadTableSize = reader.ReadInt32Clamped(10_000_000);
             m_PreloadTable = new List<PPtr<Object>>();
             for (int i = 0; i < m_PreloadTableSize; i++)
             {
                 m_PreloadTable.Add(new PPtr<Object>(reader));
             }
 
-            var m_ContainerSize = reader.ReadInt32();
+            var m_ContainerSize = reader.ReadInt32Clamped(1_000_000);
             m_Container = new List<KeyValuePair<string, AssetInfo>>();
             for (int i = 0; i < m_ContainerSize; i++)
             {

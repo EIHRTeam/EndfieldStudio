@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 
 namespace AnimeStudio
 {
@@ -81,7 +81,7 @@ namespace AnimeStudio
             m_ID = reader.ReadUInt32Array();
 
 
-            int numAxes = reader.ReadInt32();
+            int numAxes = reader.ReadInt32Clamped(1_000_000);
             m_AxesArray = new List<Axes>();
             for (int i = 0; i < numAxes; i++)
             {
@@ -410,7 +410,7 @@ namespace AnimeStudio
             // tested with multiple games, both hoyo and base unity and this align doesnt mess anything up....
             reader.AlignStream();
 
-            int numTOS = reader.ReadInt32();
+            int numTOS = reader.ReadInt32Clamped(10_000_000);
             m_TOS = new Dictionary<uint, string>();
             for (int i = 0; i < numTOS; i++)
             {

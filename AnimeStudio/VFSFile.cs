@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
@@ -32,6 +32,18 @@ namespace AnimeStudio
             reader.ReadBytes(8);
             m_Header = VFSUtils.ReadHeader(reader, game);
             Logger.Verbose($"Header : {m_Header.ToString()}");
+
+            // Sanity check: VFS header 字段经过 descramble 后应该合理
+            // 文件才 6 KB 但 descramble 出 uncompressedBlocksInfoSize=14 GB → key/常量不匹配
+            const uint MaxVFSBlocksInfoSize = 64 * 1024 * 1024;  // 64 MB
+            if (m_Header.uncompressedBlocksInfoSize > MaxVFSBlocksInfoSize ||
+                m_Header.compressedBlocksInfoSize > MaxVFSBlocksInfoSize)
+            {
+                throw new IOException(
+                    $"VFS header sanity check failed: uncompressedBlocksInfoSize={m_Header.uncompressedBlocksInfoSize:N0} " +
+                    $"compressedBlocksInfoSize={m_Header.compressedBlocksInfoSize:N0} " +
+                    $"(file size={reader.BaseStream.Length:N0}). Likely VFS key/constant mismatch.");
+            }
 
             // go to blocks info
             uint blockInfosOffset;
@@ -121,12 +133,13 @@ namespace AnimeStudio
         private Stream CreateBlocksStream(string path)
         {
             Stream blocksStream;
-            var uncompressedSizeSum = (int)m_BlocksInfo.Sum(x => x.uncompressedSize);
+            long uncompressedSizeSum = m_BlocksInfo.Sum(x => (long)x.uncompressedSize);
             Logger.Verbose($"Total size of decompressed blocks: 0x{uncompressedSizeSum:X8}");
-            if (uncompressedSizeSum >= int.MaxValue)
-                blocksStream = new FileStream(path + ".temp", FileMode.Create, FileAccess.ReadWrite, FileShare.None, 4096, FileOptions.DeleteOnClose);
-            else
-                blocksStream = new MemoryStream(uncompressedSizeSum);
+            // Sanity: 总解压大小不应超过单个文件大小 × 50（极保守）或 2GB 硬上限
+            const long MaxBlocksStreamSize = 2L * 1024 * 1024 * 1024;  // 2 GB
+            if (uncompressedSizeSum >= MaxBlocksStreamSize)
+                throw new IOException($"VFS blocks stream too large: {uncompressedSizeSum:N0} bytes (max {MaxBlocksStreamSize:N0})");
+            blocksStream = new MemoryStream((int)uncompressedSizeSum);
             return blocksStream;
         }
 
@@ -134,6 +147,15 @@ namespace AnimeStudio
         {
             foreach (var blockInfo in m_BlocksInfo)
             {
+                // Sanity check: 单个 block 的 size 不应超过文件本身大小 × 合理膨胀比
+                long fileSize = reader.BaseStream.Length;
+                if (blockInfo.compressedSize > fileSize || blockInfo.uncompressedSize > fileSize * 20)
+                {
+                    throw new IOException(
+                        $"VFS block sanity check failed: compressedSize={blockInfo.compressedSize:N0} " +
+                        $"uncompressedSize={blockInfo.uncompressedSize:N0} (file size={fileSize:N0})");
+                }
+
                 var compressionType = (int)blockInfo.flags; // no mask
                 Logger.Verbose($"Block compression type {compressionType}");
 
@@ -197,11 +219,9 @@ namespace AnimeStudio
                 fileList.Add(file);
                 file.path = node.path;
                 file.fileName = Path.GetFileName(node.path);
-                if (node.size >= int.MaxValue)
+                if (node.size >= int.MaxValue || node.size > 512 * 1024 * 1024)  // 512 MB per file
                 {
-                    var extractPath = path + "_unpacked" + Path.DirectorySeparatorChar;
-                    Directory.CreateDirectory(extractPath);
-                    file.stream = new FileStream(extractPath + file.fileName, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite);
+                    throw new IOException($"VFS node size too large: {node.size:N0} bytes for file {node.path}");
                 }
                 else
                     file.stream = new MemoryStream((int)node.size);

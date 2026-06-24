@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using Newtonsoft.Json;
 using System.Collections.Generic;
 
@@ -93,7 +93,7 @@ namespace AnimeStudio
         {
             var version = reader.version;
 
-            int m_TexEnvsSize = reader.ReadInt32();
+            int m_TexEnvsSize = reader.ReadInt32Clamped(1_000_000);
             m_TexEnvs = new List<KeyValuePair<string, UnityTexEnv>>();
             for (int i = 0; i < m_TexEnvsSize; i++)
             {
@@ -102,7 +102,7 @@ namespace AnimeStudio
 
             if (version[0] >= 2021) //2021.1 and up
             {
-                int m_IntsSize = reader.ReadInt32();
+                int m_IntsSize = reader.ReadInt32Clamped(1_000_000);
                 m_Ints = new List<KeyValuePair<string, int>>();
                 for (int i = 0; i < m_IntsSize; i++)
                 {
@@ -110,14 +110,14 @@ namespace AnimeStudio
                 }
             }
 
-            int m_FloatsSize = reader.ReadInt32();
+            int m_FloatsSize = reader.ReadInt32Clamped(1_000_000);
             m_Floats = new List<KeyValuePair<string, float>>();
             for (int i = 0; i < m_FloatsSize; i++)
             {
                 m_Floats.Add(new(reader.ReadAlignedString(), reader.ReadSingle()));
             }
 
-            int m_ColorsSize = reader.ReadInt32();
+            int m_ColorsSize = reader.ReadInt32Clamped(1_000_000);
             m_Colors = new List<KeyValuePair<string, Color>>();
             for (int i = 0; i < m_ColorsSize; i++)
             {
@@ -192,7 +192,7 @@ namespace AnimeStudio
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 1)) //5.1 and up
             {
-                var stringTagMapSize = reader.ReadInt32();
+                var stringTagMapSize = reader.ReadInt32Clamped(1_000_000);
                 for (int i = 0; i < stringTagMapSize; i++)
                 {
                     var first = reader.ReadAlignedString();

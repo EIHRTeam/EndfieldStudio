@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 
 namespace AnimeStudio
 {
@@ -23,7 +23,7 @@ namespace AnimeStudio
 
         public IndexObject(ObjectReader reader) : base(reader)
         {
-            Count = reader.ReadInt32();
+            Count = reader.ReadInt32Clamped(1_000_000);
             AssetMap = new List<KeyValuePair<string, Index>>();
             for (int i = 0; i < Count; i++)
             {

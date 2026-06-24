@@ -1,4 +1,4 @@
-﻿using ZstdSharp;
+using ZstdSharp;
 using System;
 using System.Data;
 using System.IO;
@@ -441,6 +441,15 @@ namespace AnimeStudio
             MemoryStream blocksInfoUncompresseddStream;
             var blocksInfoBytesSpan = blocksInfoBytes.AsSpan(0, (int)m_Header.compressedBlocksInfoSize);
             var uncompressedSize = m_Header.uncompressedBlocksInfoSize;
+            // Sanity check: blocksInfo 通常只有几 KB ~ 几百 KB；> 64 MB 一定是损坏/篡改的 header 字段
+            // 不做校验会让 ArrayPool.Rent(uncompressedSize) 在 uncompressedSize≈14GB 时直接 OOM 整个进程
+            const uint MaxBlocksInfoSize = 64 * 1024 * 1024;  // 64 MB
+            if (uncompressedSize > MaxBlocksInfoSize)
+            {
+                throw new IOException(
+                    $"BlocksInfo uncompressedSize too large: {uncompressedSize:N0} bytes (max {MaxBlocksInfoSize:N0}). " +
+                    $"Likely corrupted bundle header (compressedSize={m_Header.compressedBlocksInfoSize:N0}).");
+            }
             var compressionType = (CompressionType)(m_Header.flags & ArchiveFlags.CompressionTypeMask);
             Logger.Verbose($"BlockInfo compression type: {compressionType}");
             switch (compressionType) //kArchiveCompressionTypeMask

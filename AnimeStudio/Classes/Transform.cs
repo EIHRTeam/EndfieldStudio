@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -19,7 +19,7 @@ namespace AnimeStudio
             m_LocalPosition = reader.ReadVector3();
             m_LocalScale = reader.ReadVector3();
 
-            int m_ChildrenCount = reader.ReadInt32();
+            int m_ChildrenCount = reader.ReadInt32Clamped(1_000_000);
             m_Children = new List<PPtr<Transform>>();
             for (int i = 0; i < m_ChildrenCount; i++)
             {

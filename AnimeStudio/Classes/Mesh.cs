@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections;
 using System.Collections.Generic;
@@ -141,7 +141,7 @@ namespace AnimeStudio
 
             if (version[0] >= 4) //4.0 and up
             {
-                var m_ChannelsSize = reader.ReadInt32();
+                var m_ChannelsSize = reader.ReadInt32Clamped(1_000_000);
                 m_Channels = new List<ChannelInfo>();
                 for (int i = 0; i < m_ChannelsSize; i++)
                 {
@@ -151,7 +151,7 @@ namespace AnimeStudio
 
             if (version[0] < 5) //5.0 down
             {
-                var numStreams = version[0] < 4 ? 4 : reader.ReadInt32();
+                var numStreams = version[0] < 4 ? 4 : reader.ReadInt32Clamped(1_000_000);
                 m_Streams = new List<StreamInfo>();
                 for (int i = 0; i < numStreams; i++)
                 {
@@ -371,14 +371,14 @@ namespace AnimeStudio
 
             if (version[0] > 4 || (version[0] == 4 && version[1] >= 3)) //4.3 and up
             {
-                int numVerts = reader.ReadInt32();
+                int numVerts = reader.ReadInt32Clamped(10_000_000);
                 vertices = new List<BlendShapeVertex>();
                 for (int i = 0; i < numVerts; i++)
                 {
                     vertices.Add(new BlendShapeVertex(reader));
                 }
 
-                int numShapes = reader.ReadInt32();
+                int numShapes = reader.ReadInt32Clamped(1_000_000);
                 shapes = new List<MeshBlendShape>();
                 for (int i = 0; i < numShapes; i++)
                 {
@@ -390,7 +390,7 @@ namespace AnimeStudio
                     reader.AlignStream();
                 }
 
-                int numChannels = reader.ReadInt32();
+                int numChannels = reader.ReadInt32Clamped(1_000_000);
                 channels = new List<MeshBlendShapeChannel>();
                 for (int i = 0; i < numChannels; i++)
                 {
@@ -402,7 +402,7 @@ namespace AnimeStudio
                 if (reader.Game.Type.IsHNACB1())
                 {
                     additionalVertices = new List<BlendShapeAdditionalVertex>();
-                    var length = reader.ReadInt32();
+                    var length = reader.ReadInt32Clamped(1_000_000);
                     for (int i = 0; i < length; i++)
                     {
                         var additionalVertex = new BlendShapeAdditionalVertex(reader);
@@ -445,14 +445,14 @@ namespace AnimeStudio
             }
             else
             {
-                var m_ShapesSize = reader.ReadInt32();
+                var m_ShapesSize = reader.ReadInt32Clamped(1_000_000);
                 var m_Shapes = new List<MeshBlendShape>();
                 for (int i = 0; i < m_ShapesSize; i++)
                 {
                     m_Shapes.Add(new MeshBlendShape(reader));
                 }
                 reader.AlignStream();
-                var m_ShapeVerticesSize = reader.ReadInt32();
+                var m_ShapeVerticesSize = reader.ReadInt32Clamped(1_000_000);
                 var m_ShapeVertices = new List<BlendShapeVertex>(); //MeshBlendShapeVertex
                 for (int i = 0; i < m_ShapeVerticesSize; i++)
                 {
@@ -550,7 +550,7 @@ namespace AnimeStudio
 
             if (version[0] == 2 && version[1] <= 5) //2.5 and down
             {
-                int m_IndexBuffer_size = reader.ReadInt32();
+                int m_IndexBuffer_size = reader.ReadInt32Clamped(100_000_000);
 
                 if (m_Use16BitIndices)
                 {
@@ -567,7 +567,7 @@ namespace AnimeStudio
                 }
             }
 
-            int m_SubMeshesSize = reader.ReadInt32();
+            int m_SubMeshesSize = reader.ReadInt32Clamped(1_000_000);
             m_SubMeshes = new List<SubMesh>();
             for (int i = 0; i < m_SubMeshesSize; i++)
             {
@@ -590,7 +590,7 @@ namespace AnimeStudio
             {
                 if (version[0] >= 2019) //2019 and up
                 {
-                    var m_BonesAABBSize = reader.ReadInt32();
+                    var m_BonesAABBSize = reader.ReadInt32Clamped(1_000_000);
                     var m_BonesAABB = new List<MinMaxAABB>();
                     for (int i = 0; i < m_BonesAABBSize; i++)
                     {
@@ -664,7 +664,7 @@ namespace AnimeStudio
                     m_Use16BitIndices = m_IndexFormat == 0;
                 }
 
-                int m_IndexBuffer_size = reader.ReadInt32();
+                int m_IndexBuffer_size = reader.ReadInt32Clamped(100_000_000);
                 if (m_Use16BitIndices)
                 {
                     m_IndexBuffer = new uint[m_IndexBuffer_size / 2];
@@ -682,10 +682,10 @@ namespace AnimeStudio
 
             if (version[0] < 3 || (version[0] == 3 && version[1] < 5)) //3.4.2 and earlier
             {
-                m_VertexCount = reader.ReadInt32();
+                m_VertexCount = reader.ReadInt32Clamped(10_000_000);
                 m_Vertices = reader.ReadSingleArray(m_VertexCount * 3); //Vector3
 
-                var skinNum = reader.ReadInt32();
+                var skinNum = reader.ReadInt32Clamped(1_000_000);
                 m_Skin = new List<BoneWeights4>();
                 for (int s = 0; s < skinNum; s++)
                 {
@@ -694,13 +694,13 @@ namespace AnimeStudio
 
                 m_BindPose = reader.ReadMatrixArray();
 
-                m_UV0 = reader.ReadSingleArray(reader.ReadInt32() * 2); //Vector2
+                m_UV0 = reader.ReadSingleArray(reader.ReadInt32Clamped(10_000_000) * 2); //Vector2
 
-                m_UV1 = reader.ReadSingleArray(reader.ReadInt32() * 2); //Vector2
+                m_UV1 = reader.ReadSingleArray(reader.ReadInt32Clamped(10_000_000) * 2); //Vector2
 
                 if (version[0] == 2 && version[1] <= 5) //2.5 and down
                 {
-                    int m_TangentSpace_size = reader.ReadInt32();
+                    int m_TangentSpace_size = reader.ReadInt32Clamped(10_000_000);
                     m_Normals = new float[m_TangentSpace_size * 3];
                     m_Tangents = new float[m_TangentSpace_size * 4];
                     for (int v = 0; v < m_TangentSpace_size; v++)
@@ -716,16 +716,16 @@ namespace AnimeStudio
                 }
                 else //2.6.0 and later
                 {
-                    m_Tangents = reader.ReadSingleArray(reader.ReadInt32() * 4); //Vector4
+                    m_Tangents = reader.ReadSingleArray(reader.ReadInt32Clamped(10_000_000) * 4); //Vector4
 
-                    m_Normals = reader.ReadSingleArray(reader.ReadInt32() * 3); //Vector3
+                    m_Normals = reader.ReadSingleArray(reader.ReadInt32Clamped(10_000_000) * 3); //Vector3
                 }
             }
             else
             {
                 if (version[0] < 2018 || (version[0] == 2018 && version[1] < 2)) //2018.2 down
                 {
-                    var skinNum = reader.ReadInt32();
+                    var skinNum = reader.ReadInt32Clamped(1_000_000);
                     m_Skin = new List<BoneWeights4>();
                     for (int s = 0; s < skinNum; s++)
                     {
@@ -750,7 +750,7 @@ namespace AnimeStudio
 
             if (version[0] < 3 || (version[0] == 3 && version[1] <= 4)) //3.4.2 and earlier
             {
-                int m_Colors_size = reader.ReadInt32();
+                int m_Colors_size = reader.ReadInt32Clamped(10_000_000);
                 m_Colors = new float[m_Colors_size * 4];
                 for (int v = 0; v < m_Colors_size * 4; v++)
                 {

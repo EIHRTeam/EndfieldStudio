@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.IO;
 
 namespace AnimeStudio
@@ -44,7 +44,7 @@ namespace AnimeStudio
             var m_AudioLanguage = reader.ReadStringArray();
             if (version[0] >= 2020) //2020.1 and up
             {
-                var m_VideoShadersSize = reader.ReadInt32();
+                var m_VideoShadersSize = reader.ReadInt32Clamped(1_000_000);
                 var m_VideoShaders = new List<PPtr<Shader>>();
                 for (int i = 0; i < m_VideoShadersSize; i++)
                 {

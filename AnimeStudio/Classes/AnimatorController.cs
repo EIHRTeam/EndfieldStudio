@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -269,7 +269,7 @@ namespace AnimeStudio
             m_ChildPairVectorArray = reader.ReadVector2Array();
             m_ChildPairAvgMagInvArray = reader.ReadSingleArray();
 
-            int numNeighbours = reader.ReadInt32();
+            int numNeighbours = reader.ReadInt32Clamped(1_000_000);
             m_ChildNeighborListArray = new List<MotionNeighborList>();
             for (int i = 0; i < numNeighbours; i++)
             {
@@ -345,7 +345,7 @@ namespace AnimeStudio
                 m_ChildBodyMask[i] = new HumanPoseMask(reader);
             }
 
-            var numChildSkeletonMasks = reader.ReadInt32();
+            var numChildSkeletonMasks = reader.ReadInt32Clamped(100_000);
             m_ChildSkeletonMask = new SkeletonMask[numChildSkeletonMasks];
             for (int i = 0; i < numChildSkeletonMasks; i++)
             {
@@ -498,7 +498,7 @@ namespace AnimeStudio
         {
             var version = reader.version;
 
-            int numNodes = reader.ReadInt32();
+            int numNodes = reader.ReadInt32Clamped(1_000_000);
             m_NodeArray = new List<BlendTreeNodeConstant>();
             for (int i = 0; i < numNodes; i++)
             {
@@ -558,7 +558,7 @@ namespace AnimeStudio
                 }
             }
 
-            int numBlends = reader.ReadInt32();
+            int numBlends = reader.ReadInt32Clamped(1_000_000);
             m_BlendTreeConstantArray = new List<BlendTreeConstant>();
             for (int i = 0; i < numBlends; i++)
             {
@@ -678,7 +678,7 @@ namespace AnimeStudio
 
         public SelectorStateConstant(ObjectReader reader)
         {
-            int numTransitions = reader.ReadInt32();
+            int numTransitions = reader.ReadInt32Clamped(1_000_000);
             m_TransitionConstantArray = new List<SelectorTransitionConstant>();
             for (int i = 0; i < numTransitions; i++)
             {
@@ -703,7 +703,7 @@ namespace AnimeStudio
         {
             var version = reader.version;
 
-            int numStates = reader.ReadInt32();
+            int numStates = reader.ReadInt32Clamped(1_000_000);
             m_StateConstantArray = new List<StateConstant>();
             for (int i = 0; i < numStates; i++)
             {
@@ -719,7 +719,7 @@ namespace AnimeStudio
 
             if (version[0] >= 5) //5.0 and up
             {
-                int numSelectors = reader.ReadInt32();
+                int numSelectors = reader.ReadInt32Clamped(1_000_000);
                 m_SelectorStateConstantArray = new List<SelectorStateConstant>();
                 for (int i = 0; i < numSelectors; i++)
                 {
@@ -866,7 +866,7 @@ namespace AnimeStudio
                 }
             }
 
-            int numClips = reader.ReadInt32();
+            int numClips = reader.ReadInt32Clamped(1_000_000);
             m_AnimationClips = new List<PPtr<AnimationClip>>();
             for (int i = 0; i < numClips; i++)
             {

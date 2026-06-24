@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Generic;
@@ -115,9 +115,15 @@ namespace AnimeStudio
             {
                 return Array.Empty<byte>();
             }
+            // 防止垃圾数据导致巨型分配：count 不能超过 stream 剩余长度
+            long remaining = BaseStream.Length - BaseStream.Position;
+            if (count < 0 || count > remaining)
+            {
+                throw new IOException($"ReadBytes count {count:N0} exceeds remaining stream length {remaining:N0} (corrupted data)");
+            }
 
             var buffer = ArrayPool<byte>.Shared.Rent(0x1000);
-            List<byte> result = new List<byte>(count);
+            List<byte> result = new(count);
             do
             {
                 var readNum = Math.Min(count, buffer.Length);
@@ -232,6 +238,13 @@ namespace AnimeStudio
 
         internal T[] ReadArray<T>(Func<T> del, int length)
         {
+            // 防止垃圾数据导致巨型数组分配
+            long remaining = BaseStream.Length - BaseStream.Position;
+            if (length < 0 || length > remaining)
+            {
+                throw new IOException($"ReadArray length {length:N0} exceeds remaining stream {remaining:N0} (corrupted data)");
+            }
+
             if (length < 0x1000)
             {
                 var array = new T[length];
@@ -243,7 +256,7 @@ namespace AnimeStudio
             }
             else
             {
-                var list = new List<T>();
+                var list = new List<T>(length);
                 for (int i = 0; i < length; i++)
                 {
                     list.Add(del());
@@ -367,6 +380,24 @@ namespace AnimeStudio
                 length = ReadInt32();
             }
             return ReadArray(ReadMatrix, length);
+        }
+
+        /// <summary>
+        /// 读取 int32 并校验是否在合理范围内。
+        /// 用于替代裸 ReadInt32() + 循环/数组分配的模式，防止损坏数据读出几亿的 count 导致 OOM。
+        /// </summary>
+        /// <param name="maxCount">允许的最大值（默认 100 万）</param>
+        /// <returns>校验通过的 count</returns>
+        /// <exception cref="IOException">count 超出范围时抛出</exception>
+        public int ReadInt32Clamped(int maxCount = 1_000_000)
+        {
+            int count = ReadInt32();
+            if (count < 0 || count > maxCount)
+            {
+                throw new IOException(
+                    $"ReadInt32Clamped: count {count:N0} out of range [0, {maxCount:N0}] at position {Position:X} (corrupted data)");
+            }
+            return count;
         }
     }
 }

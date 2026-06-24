@@ -76,6 +76,9 @@ internal static class Program
                 "extract" => await RunExtract(args[1..]),
                 "audio" => RunAudio(args.AsSpan(1)),
                 "video" => RunVideo(args.AsSpan(1)),
+                "inspect-bundle" => RunInspectBundle(args.AsSpan(1)),
+                "find-bad-bundles" => RunFindBadBundles(args.AsSpan(1)),
+                "classify-bundles" => RunClassifyBundles(args.AsSpan(1)),
                 "--help" or "-h" or "help" => PrintHelpAndExit(),
                 _ => UnknownCommand(command),
             };
@@ -278,12 +281,12 @@ internal static class Program
                     if (file.FileName.EndsWith('/') || file.FileName.EndsWith('\\')) return;
 
                     string outPath = ResolveOutputPath(bt, file.FileName, outRoot);
-                    string? dir = Path.GetDirectoryName(outPath);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
                     if (bt == BlockType.Lua)
                     {
                         // Lua 文件普遍很小（~KB），后处理需要整块内存
+                        string? dir = Path.GetDirectoryName(outPath);
+                        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                         byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
                         byte[] processed = LuaProcessor.DecryptAndNormalize(data);
                         File.WriteAllBytes(outPath, processed);
@@ -301,6 +304,8 @@ internal static class Program
                     }
                     else
                     {
+                        string? dir = Path.GetDirectoryName(outPath);
+                        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                         // 其他类型直接流式：ChaCha20 解密 → 直接写盘，零拷贝中间态
                         using var fs = new FileStream(
                             outPath,
@@ -357,6 +362,7 @@ internal static class Program
         public int Mp3Bitrate = 192;  // kbps，仅 mp3 模式使用（默认 192，VBR-quality 折中）
         public int? Mp3Vbr;            // VBR 质量等级 0-9（数字越小越好，0≈245kbps, 4≈165kbps, 9≈65kbps）
         public int Threads;
+        public Regex? AudioFilter;     // 映射路径正则过滤器（null = 不过滤）
     }
 
     private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice }
@@ -423,6 +429,16 @@ internal static class Program
                 case "--threads":
                 case "-t":
                     parsed.Threads = int.Parse(RequireValue(args, ref i, a));
+                    break;
+                case "--audio-filter":
+                    {
+                        string pattern = RequireValue(args, ref i, a);
+                        parsed.AudioFilter = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+                    }
+                    break;
+                case "--operator-only":
+                    // 快捷方式：只提取干员语音
+                    parsed.AudioFilter = new Regex(@"Characters/chr_\d+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
                     break;
                 default:
                     throw new ArgumentException($"Unknown argument: {a}");
@@ -702,6 +718,8 @@ internal static class Program
                 int success = 0;
                 int errors = 0;
                 int unmapped = 0;
+                int skipped = 0;
+                Regex? audioFilter = parsed.AudioFilter;
 
                 foreach (var (pckName, pckData) in pckFiles)
                 {
@@ -723,6 +741,7 @@ internal static class Program
                     int localSuccess = 0;
                     int localErrors = 0;
                     int localUnmapped = 0;
+                    int localSkipped = 0;
 
                     Parallel.ForEach(entries, opts, entry =>
                     {
@@ -750,18 +769,20 @@ internal static class Program
 
                             if (audioMap.GetPath(hash) is string mappedPath)
                             {
+                                // 正则过滤：如果不匹配则跳过
+                                if (audioFilter != null && !audioFilter.IsMatch(mappedPath))
+                                {
+                                    Interlocked.Increment(ref localSkipped);
+                                    return;
+                                }
                                 string pathWithExt = Path.ChangeExtension(mappedPath, outExt);
                                 outPath = Path.Combine(parsed.OutPath!, pathWithExt);
                             }
                             else
                             {
-                                Interlocked.Increment(ref localUnmapped);
-                                string filename = $"{entry.Id}{outExt}";
-                                outPath = Path.Combine(
-                                    parsed.OutPath!,
-                                    "unmapped",
-                                    AudioMap.LanguageToLower(lang),
-                                    filename);
+                                // 未映射的文件：跳过不导出
+                                Interlocked.Increment(ref localSkipped);
+                                return;
                             }
 
                             string? dir = Path.GetDirectoryName(outPath);
@@ -792,9 +813,13 @@ internal static class Program
                     success += localSuccess;
                     errors += localErrors;
                     unmapped += localUnmapped;
+                    skipped += localSkipped;
                 }
 
-                Console.WriteLine($"    Done: processed {success} entries ({unmapped} unmapped, {errors} errors)");
+                if (audioFilter != null)
+                    Console.WriteLine($"    Done: processed {success} entries ({skipped} filtered, {unmapped} unmapped, {errors} errors)");
+                else
+                    Console.WriteLine($"    Done: processed {success} entries ({unmapped} unmapped, {errors} errors)");
                 Interlocked.Add(ref totalSuccess, success);
                 Interlocked.Add(ref totalErrors, errors);
                 Interlocked.Add(ref totalUnmapped, unmapped);
@@ -1235,6 +1260,639 @@ internal static class Program
     }
 
     /// <summary>
+    /// find-bad-bundles: 扫描所有 VFS bundle，用 per-bundle alloc 检测识别坏 bundle，
+    /// 把 hash + 元信息写到 JSON 清单，并把坏 bundle 文件 copy 到 out-dir 供后续研究。
+    /// 单线程串行处理，不并发，确保 alloc delta 精确。
+    /// </summary>
+    private static int RunFindBadBundles(ReadOnlySpan<string> args)
+    {
+        string? vfsPath = null;
+        string outDir = "bad-bundles";
+        long allocThresholdMb = 200;
+        int limit = 0;
+        int saveGoodCount = 0;
+        string goodDir = "good-bundles";
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            switch (a)
+            {
+                case "--vfs": vfsPath = RequireValue(args, ref i, a); break;
+                case "--out-dir": outDir = RequireValue(args, ref i, a); break;
+                case "--threshold-mb": allocThresholdMb = long.Parse(RequireValue(args, ref i, a)); break;
+                case "--limit": limit = int.Parse(RequireValue(args, ref i, a)); break;
+                case "--save-good": saveGoodCount = int.Parse(RequireValue(args, ref i, a)); break;
+                case "--good-dir": goodDir = RequireValue(args, ref i, a); break;
+                default: throw new ArgumentException($"Unknown argument: {a}");
+            }
+        }
+        if (vfsPath is null) throw new ArgumentException("--vfs is required");
+
+        Directory.CreateDirectory(outDir);
+        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
+        long allocThresholdBytes = allocThresholdMb * 1024L * 1024L;
+        string scratch = "/dev/shm/efend-bad-scan";
+        Directory.CreateDirectory(scratch);
+
+        var allFiles = new List<(BlockType bt, ChunkInfo chunk, AnimeStudio.Endfield.FileInfo file)>();
+        foreach (var bt in new[] { BlockType.Bundle })
+        {
+            BlockMainInfo info;
+            try { info = loader.LoadBlockInfo(bt); }
+            catch (DirectoryNotFoundException) { continue; }
+            foreach (var chunk in info.Chunks)
+                foreach (var file in chunk.Files)
+                {
+                    if (string.IsNullOrEmpty(file.FileName)) continue;
+                    if (file.FileName.EndsWith('/') || file.FileName.EndsWith('\\')) continue;
+                    allFiles.Add((bt, chunk, file));
+                }
+        }
+
+        Console.WriteLine($"Scanning {allFiles.Count:N0} bundles (threshold={allocThresholdMb} MB)...");
+        var badBundles = new List<(string hash, long fileSize, long allocBytes, double decodeMs, string? error)>();
+        int scanned = 0, badCount = 0, goodSaved = 0;
+        int[] goodBucketCounts = new int[9];  // 9 个大小区间，每个最多存 saveGoodCount 个
+        var sw = Stopwatch.StartNew();
+
+        foreach (var (bt, chunk, file) in allFiles)
+        {
+            if (limit > 0 && scanned >= limit) break;
+            scanned++;
+            string hash = Path.GetFileNameWithoutExtension(file.FileName);
+            string bundlePath = Path.Combine(scratch, hash + ".ab");
+
+            try
+            {
+                using (var fs = new FileStream(bundlePath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+                    loader.ExtractFile(bt, chunk, file, fs);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  [{scanned}/{allFiles.Count}] EXTRACT FAIL: {hash} - {ex.Message}");
+                try { File.Delete(bundlePath); } catch { }
+                continue;
+            }
+
+            // 计算大小桶
+            int bucket = file.Length switch
+            {
+                < 2048 => 0, < 8192 => 1, < 32768 => 2, < 131072 => 3,
+                < 524288 => 4, < 2097152 => 5, < 8388608 => 6, < 33554432 => 7, _ => 8
+            };
+
+            // 快速采样模式（threshold-mb < 0）：只按大小分桶保存，不 LoadFiles
+            if (allocThresholdMb < 0)
+            {
+                if (saveGoodCount > 0 && goodBucketCounts[bucket] < saveGoodCount)
+                {
+                    goodBucketCounts[bucket]++;
+                    Directory.CreateDirectory(goodDir);
+                    string goodFile = Path.Combine(goodDir, $"good_b{bucket}_{hash}.ab");
+                    try { File.Copy(bundlePath, goodFile, overwrite: true); } catch { }
+                    goodSaved++;
+                    Console.WriteLine($"  saved bucket{bucket} {hash} ({file.Length}B) [{goodSaved} total]");
+                }
+                try { File.Delete(bundlePath); } catch { }
+                // 全部桶都满了就停止
+                bool allFull = true;
+                for (int bi = 0; bi < 9; bi++) if (goodBucketCounts[bi] < saveGoodCount) { allFull = false; break; }
+                if (allFull)
+                {
+                    Console.WriteLine($"All 9 buckets filled, stopping.");
+                    scanned++;
+                    break;
+                }
+                scanned++;
+                continue;
+            }
+
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            var swBundle = Stopwatch.StartNew();
+            string? error = null;
+            long allocDelta;
+            try
+            {
+                var mgr = new AS.AssetsManager
+                {
+                    Game = AS.GameManager.GetGame(AS.GameType.ArknightsEndfield),
+                    Silent = true, SkipProcess = false,
+                };
+                // 让 SerializedFile 解析层在超限时立即中断
+                mgr.PerFileAllocBudgetBytes = allocThresholdBytes;
+                mgr.LoadFiles(bundlePath);
+                allocDelta = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+                mgr.Clear();
+            }
+            catch (Exception ex)
+            {
+                allocDelta = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+                error = ex.GetType().Name + ": " + ex.Message;
+            }
+            swBundle.Stop();
+
+            if (allocDelta > allocThresholdBytes)
+            {
+                badCount++;
+                badBundles.Add((hash, file.Length, allocDelta, swBundle.Elapsed.TotalMilliseconds, error));
+                string destFile = Path.Combine(outDir, $"alloc{allocDelta / 1024 / 1024}MB_{hash}.ab");
+                try { File.Copy(bundlePath, destFile, overwrite: true); } catch { }
+                Console.WriteLine($"  [{scanned}/{allFiles.Count}] BAD: {hash} alloc={allocDelta / 1024.0 / 1024.0:F0}MB size={file.Length}B dur={swBundle.Elapsed.TotalMilliseconds:F0}ms → {destFile}");
+            }
+            else
+            {
+                goodSaved++;
+                // 复用上面算的 bucket
+                if (saveGoodCount > 0 && goodBucketCounts[bucket] < saveGoodCount)
+                {
+                    goodBucketCounts[bucket]++;
+                    Directory.CreateDirectory(goodDir);
+                    string goodFile = Path.Combine(goodDir, $"good_b{bucket}_{hash}.ab");
+                    try { File.Copy(bundlePath, goodFile, overwrite: true); } catch { }
+                }
+                if (scanned % 1000 == 0)
+                {
+                    double rate = scanned / sw.Elapsed.TotalSeconds;
+                    Console.WriteLine($"  [{scanned}/{allFiles.Count}] OK ({rate:F0}/s, {badCount} bad, {goodSaved} good)");
+                }
+            }
+
+            try { File.Delete(bundlePath); } catch { }
+            if (allocDelta > allocThresholdBytes)
+            {
+                GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                GC.WaitForPendingFinalizers();
+            }
+        }
+        sw.Stop();
+
+        string manifestPath = Path.Combine(outDir, "bad-bundles.json");
+        var sb = new StringBuilder();
+        sb.AppendLine("{");
+        sb.AppendLine($"  \"scan_date\": \"{DateTime.UtcNow:O}\",");
+        sb.AppendLine($"  \"total_scanned\": {scanned},");
+        sb.AppendLine($"  \"bad_count\": {badCount},");
+        sb.AppendLine($"  \"threshold_mb\": {allocThresholdMb},");
+        sb.AppendLine($"  \"elapsed_seconds\": {sw.Elapsed.TotalSeconds:F2},");
+        sb.AppendLine("  \"bundles\": [");
+        for (int i = 0; i < badBundles.Count; i++)
+        {
+            var b = badBundles[i];
+            sb.Append("    {");
+            sb.Append($"\"hash\": \"{b.hash}\", ");
+            sb.Append($"\"file_size\": {b.fileSize}, ");
+            sb.Append($"\"alloc_mb\": {b.allocBytes / 1024.0 / 1024.0:F1}, ");
+            sb.Append($"\"decode_ms\": {b.decodeMs:F1}");
+            if (b.error != null)
+                sb.Append($", \"error\": \"{b.error.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"");
+            sb.Append(i < badBundles.Count - 1 ? "}," : "}");
+            sb.AppendLine();
+        }
+        sb.AppendLine("  ]");
+        sb.AppendLine("}");
+        File.WriteAllText(manifestPath, sb.ToString());
+
+        Console.WriteLine();
+        Console.WriteLine($"  Done: {badCount} bad / {scanned} scanned ({sw.Elapsed.TotalSeconds:F1}s)");
+        Console.WriteLine($"  Manifest: {Path.GetFullPath(manifestPath)}");
+        Console.WriteLine($"  Files: {Path.GetFullPath(outDir)}/");
+        return 0;
+    }
+
+    /// <summary>
+    /// classify-bundles: 只读 VFS header + descramble，不走 LoadFiles，零额外内存分配。
+    /// 把每个 bundle 的 descramble 后的 header 字段 dump 出来，用于离线分析好坏 bundle 的差异。
+    /// </summary>
+    private static int RunClassifyBundles(ReadOnlySpan<string> args)
+    {
+        string? vfsPath = null;
+        string outFile = "bundle-classification.tsv";
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            switch (a)
+            {
+                case "--vfs": vfsPath = RequireValue(args, ref i, a); break;
+                case "--out": outFile = RequireValue(args, ref i, a); break;
+                default: throw new ArgumentException($"Unknown argument: {a}");
+            }
+        }
+        if (vfsPath is null) throw new ArgumentException("--vfs is required");
+
+        var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
+
+        // 收集所有 bundle
+        var allFiles = new List<(BlockType bt, ChunkInfo chunk, AnimeStudio.Endfield.FileInfo file)>();
+        foreach (var bt in new[] { BlockType.Bundle })
+        {
+            BlockMainInfo info;
+            try { info = loader.LoadBlockInfo(bt); }
+            catch (DirectoryNotFoundException) { continue; }
+            foreach (var chunk in info.Chunks)
+                foreach (var file in chunk.Files)
+                {
+                    if (string.IsNullOrEmpty(file.FileName)) continue;
+                    if (file.FileName.EndsWith('/') || file.FileName.EndsWith('\\')) continue;
+                    allFiles.Add((bt, chunk, file));
+                }
+        }
+        Console.WriteLine($"Classifying {allFiles.Count:N0} bundles (header-only, zero alloc)...");
+
+        using var writer = new StreamWriter(outFile);
+        // TSV header
+        writer.WriteLine("hash\tfile_size\tcompressedSize\tuncompressedSize\tflags\tencFlags\theaderSize\tblocksCount\tstatus\tnotes");
+
+        int good = 0, bad = 0, error = 0;
+        var sw = Stopwatch.StartNew();
+
+        string scratch = "/dev/shm/efend-classify";
+        Directory.CreateDirectory(scratch);
+
+        foreach (var (bt, chunk, file) in allFiles)
+        {
+            string hash = Path.GetFileNameWithoutExtension(file.FileName);
+            string bundlePath = Path.Combine(scratch, $"_{hash}.ab");
+
+            // 解密到临时文件
+            long fileLen = file.Length;
+            try
+            {
+                using (var fs = new FileStream(bundlePath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, 4096, FileOptions.SequentialScan))
+                {
+                    loader.ExtractFile(bt, chunk, file, fs);
+                }
+            }
+            catch (Exception ex)
+            {
+                writer.WriteLine($"{hash}\t{fileLen}\t-\t-\t-\t-\t-\t-\tEXTRACT_ERROR\t{ex.Message}");
+                error++;
+                continue;
+            }
+
+            // 读取并解析 VFS header（复用 FileReader 逻辑，不进入 LoadFiles）
+            string status;
+            string notes = "";
+            uint csz = 0, usz = 0, flags = 0, encFlags = 0, hdrSize = 0;
+            int blocksCount = -1;
+
+            try
+            {
+                using var reader = new AnimeStudio.FileReader(bundlePath);
+                // VFSUtils.IsValidHeader 已在 FileReader.CheckFileType 里调用
+                if (reader.FileType != AnimeStudio.FileType.VFSFile)
+                {
+                    status = "NOT_VFS";
+                    notes = $"fileType={reader.FileType}";
+                    bad++;
+                }
+                else
+                {
+                    // 手动读 header（复刻 VFSFile 构造函数开头）
+                    reader.Endian = EndianType.BigEndian;
+                    reader.ReadBytes(8); // skip magic
+                    var hdr = AnimeStudio.VFSUtils.ReadHeader(reader, GameType.ArknightsEndfield);
+                    csz = hdr.compressedBlocksInfoSize;
+                    usz = hdr.uncompressedBlocksInfoSize;
+                    flags = (uint)hdr.flags;
+                    encFlags = hdr.encFlags;
+                    hdrSize = (uint)hdr.size;
+
+                    // 简单判别：header 字段是否合理
+                    bool sizeOk = usz > 0 && usz < 10_000_000 && csz > 0 && csz <= fileLen + 256;
+                    if (sizeOk)
+                        status = "GOOD";
+                    else
+                    {
+                        status = "BAD_HEADER";
+                        notes = $"usz={usz} csz={csz}";
+                        bad++;
+                    }
+                    if (status == "GOOD") good++;
+                }
+            }
+            catch (Exception ex)
+            {
+                status = "PARSE_ERROR";
+                notes = ex.GetType().Name + ":" + ex.Message.Replace("\t", " ").Replace("\n", " ");
+                error++;
+            }
+
+            writer.WriteLine($"{hash}\t{fileLen}\t{csz}\t{usz}\t0x{flags:X8}\t0x{encFlags:X8}\t{hdrSize}\t{blocksCount}\t{status}\t{notes}");
+
+            try { File.Delete(bundlePath); } catch { }
+
+            if ((good + bad + error) % 5000 == 0)
+            {
+                double rate = (good + bad + error) / sw.Elapsed.TotalSeconds;
+                Console.WriteLine($"  [{good + bad + error}/{allFiles.Count}] good={good} bad={bad} err={error} ({rate:F0}/s)");
+            }
+        }
+        sw.Stop();
+
+        writer.Flush();
+        Console.WriteLine();
+        Console.WriteLine($"  Done in {sw.Elapsed.TotalSeconds:F1}s");
+        Console.WriteLine($"  Total: {allFiles.Count}  Good: {good}  Bad: {bad}  Error: {error}");
+        Console.WriteLine($"  TSV: {Path.GetFullPath(outFile)}");
+        return 0;
+    }
+
+    /// <summary>
+    /// inspect-bundle: 探查一个未知格式的 bundle 文件，识别 magic、计算分段熵、尝试常见解密变换、
+    /// 打印 hex dump 和 ASCII strings，帮助确定文件内部到底是什么。
+    /// </summary>
+    private static int RunInspectBundle(ReadOnlySpan<string> args)
+    {
+        string? filePath = null;
+        int dumpBytes = 512;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            switch (a)
+            {
+                case "--file":
+                case "-f": filePath = RequireValue(args, ref i, a); break;
+                case "--dump-bytes": dumpBytes = int.Parse(RequireValue(args, ref i, a)); break;
+                default:
+                    if (filePath == null) { filePath = a; break; }
+                    throw new ArgumentException($"Unknown argument: {a}");
+            }
+        }
+        if (filePath == null) throw new ArgumentException("--file is required (or pass path as positional arg)");
+        if (!File.Exists(filePath)) throw new FileNotFoundException(filePath);
+
+        byte[] data = File.ReadAllBytes(filePath);
+        Console.WriteLine($"File:       {Path.GetFullPath(filePath)}");
+        Console.WriteLine($"Size:       {data.Length:N0} bytes ({data.Length / 1024.0:F2} KB)");
+        Console.WriteLine();
+
+        // ── 1. Magic 探测 ──
+        Console.WriteLine("── Magic detection ──");
+        var magics = new (string name, byte[] sig, int offset)[]
+        {
+            ("UnityFS",  System.Text.Encoding.ASCII.GetBytes("UnityFS"), 0),
+            ("UnityWeb", System.Text.Encoding.ASCII.GetBytes("UnityWeb"), 0),
+            ("UnityRaw", System.Text.Encoding.ASCII.GetBytes("UnityRaw"), 0),
+            ("Blb\\x02", new byte[]{(byte)'B',(byte)'l',(byte)'b',0x02}, 0),
+            ("Blb\\x03", new byte[]{(byte)'B',(byte)'l',(byte)'b',0x03}, 0),
+            ("AKPK",     System.Text.Encoding.ASCII.GetBytes("AKPK"), 0),
+            ("RIFF",     System.Text.Encoding.ASCII.GetBytes("RIFF"), 0),
+            ("RIFX",     System.Text.Encoding.ASCII.GetBytes("RIFX"), 0),
+            (":)xD",     System.Text.Encoding.ASCII.GetBytes(":)xD"), 0),
+            ("PK\\x03",  new byte[]{0x50,0x4B,0x03,0x04}, 0),
+            ("Gzip",     new byte[]{0x1F,0x8B}, 0),
+            ("LZ4 Frame",new byte[]{0x04,0x22,0x4D,0x18}, 0),
+            ("Zstd",     new byte[]{0x28,0xB5,0x2F,0xFD}, 0),
+            ("XZ",       new byte[]{0xFD,(byte)'7',(byte)'z',(byte)'X',(byte)'Z',0x00}, 0),
+            ("LZMA",     new byte[]{0x5D,0x00,0x00}, 0),
+        };
+        bool anyMatch = false;
+        foreach (var (name, sig, offset) in magics)
+        {
+            if (data.Length >= offset + sig.Length &&
+                data.AsSpan(offset, sig.Length).SequenceEqual(sig))
+            {
+                Console.WriteLine($"  ✓ Match at offset {offset}: {name}");
+                anyMatch = true;
+            }
+        }
+        if (!anyMatch) Console.WriteLine("  (no known magic at offset 0)");
+        Console.WriteLine();
+
+        // ── 2. 分段熵分析 ──
+        Console.WriteLine("── Entropy by chunk (256 bytes per chunk, 0=all-zero, 8=random) ──");
+        const int chunkSize = 256;
+        int chunks = Math.Min(20, (data.Length + chunkSize - 1) / chunkSize);
+        for (int c = 0; c < chunks; c++)
+        {
+            int start = c * chunkSize;
+            int len = Math.Min(chunkSize, data.Length - start);
+            double h = ShannonEntropy(data, start, len);
+            string bar = new string('█', (int)Math.Round(h * 5));
+            Console.WriteLine($"  offset 0x{start:X4}-0x{start + len - 1:X4} ({len,3} bytes) entropy={h:F2}  {bar}");
+        }
+        Console.WriteLine();
+
+        // ── 3. ASCII strings extraction ──
+        Console.WriteLine("── ASCII strings (≥6 printable chars) ──");
+        var strings = ExtractStrings(data, minLen: 6, maxOutput: 30);
+        foreach (var (offset, s) in strings)
+            Console.WriteLine($"  0x{offset:X4}: {s}");
+        if (strings.Count == 0) Console.WriteLine("  (none found)");
+        Console.WriteLine();
+
+        // ── 4. 寻找 Unity 版本/revision 字符串 (常出现在 bundle header 里) ──
+        Console.WriteLine("── Unity version probe ──");
+        int versionIdx = IndexOfPattern(data, System.Text.Encoding.ASCII.GetBytes("2021."));
+        if (versionIdx < 0) versionIdx = IndexOfPattern(data, System.Text.Encoding.ASCII.GetBytes("2020."));
+        if (versionIdx < 0) versionIdx = IndexOfPattern(data, System.Text.Encoding.ASCII.GetBytes("2019."));
+        if (versionIdx >= 0)
+        {
+            int end = versionIdx;
+            while (end < data.Length && end < versionIdx + 32 && data[end] >= 0x20 && data[end] < 0x7F) end++;
+            string ver = System.Text.Encoding.ASCII.GetString(data, versionIdx, end - versionIdx);
+            Console.WriteLine($"  Found Unity version string at offset 0x{versionIdx:X}: \"{ver}\"");
+            Console.WriteLine($"  → bundle header 不是从 offset 0 开始，前 0x{versionIdx:X} 字节可能是另一层 wrapper/加密");
+        }
+        else
+        {
+            Console.WriteLine("  (no Unity version string found)");
+        }
+        Console.WriteLine();
+
+        // ── 5. 尝试若干常见解密：跳过前 N 字节后是否出现 UnityFS ──
+        Console.WriteLine("── Try skipping leading bytes + check for UnityFS ──");
+        byte[] unityFs = System.Text.Encoding.ASCII.GetBytes("UnityFS");
+        bool found = false;
+        for (int skip = 1; skip <= Math.Min(256, data.Length - 8); skip++)
+        {
+            if (data.AsSpan(skip, 7).SequenceEqual(unityFs))
+            {
+                Console.WriteLine($"  ✓ UnityFS magic at offset {skip}!");
+                found = true;
+                break;
+            }
+        }
+        if (!found) Console.WriteLine("  no UnityFS in first 256 bytes");
+
+        // 尝试 XOR with various single-byte keys
+        Console.WriteLine();
+        Console.WriteLine("── Try single-byte XOR keys, check for UnityFS in first 16 bytes ──");
+        bool xorFound = false;
+        for (int key = 1; key < 256; key++)
+        {
+            byte k = (byte)key;
+            bool match = true;
+            for (int j = 0; j < 7; j++)
+            {
+                if ((data[j] ^ k) != unityFs[j]) { match = false; break; }
+            }
+            if (match)
+            {
+                Console.WriteLine($"  ✓ XOR key 0x{k:X2} produces UnityFS at offset 0");
+                xorFound = true;
+            }
+        }
+        if (!xorFound) Console.WriteLine("  no single-byte XOR yields UnityFS");
+        Console.WriteLine();
+
+        // ── 6. Hex dump ──
+        Console.WriteLine($"── Hex dump (first {Math.Min(dumpBytes, data.Length)} bytes) ──");
+        HexDump(data, 0, Math.Min(dumpBytes, data.Length));
+
+        // ── 7. Try to interpret as UnityFS-like header (if anyone reaches here, parse defensively) ──
+        Console.WriteLine();
+        Console.WriteLine("── Tentative UnityFS-header read (raw bytes, no decryption) ──");
+        try
+        {
+            int pos = 0;
+            string sig = ReadCStringAt(data, ref pos, 32);
+            uint ver = ReadU32BE(data, ref pos);
+            string unityVer = ReadCStringAt(data, ref pos, 32);
+            string unityRev = ReadCStringAt(data, ref pos, 32);
+            long sz = ReadI64BE(data, ref pos);
+            uint csz = ReadU32BE(data, ref pos);
+            uint usz = ReadU32BE(data, ref pos);
+            uint fl = ReadU32BE(data, ref pos);
+            Console.WriteLine($"  signature(读取的字符串至 \\0): \"{Escape(sig)}\"");
+            Console.WriteLine($"  version(BE u32): {ver} (0x{ver:X8})");
+            Console.WriteLine($"  unityVersion: \"{Escape(unityVer)}\"");
+            Console.WriteLine($"  unityRevision: \"{Escape(unityRev)}\"");
+            Console.WriteLine($"  size(BE i64): {sz:N0}");
+            Console.WriteLine($"  compressedBlocksInfoSize(BE u32):   {csz:N0}  (0x{csz:X8})");
+            Console.WriteLine($"  uncompressedBlocksInfoSize(BE u32): {usz:N0}  (0x{usz:X8})   ← OOM 元凶字段");
+            Console.WriteLine($"  flags(BE u32): 0x{fl:X8}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  (failed to read as UnityFS header: {ex.Message})");
+        }
+
+        return 0;
+    }
+
+    private static string ReadCStringAt(byte[] data, ref int pos, int maxLen)
+    {
+        var sb = new StringBuilder();
+        for (int i = 0; i < maxLen && pos < data.Length; i++)
+        {
+            byte b = data[pos++];
+            if (b == 0) return sb.ToString();
+            sb.Append((char)b);
+        }
+        return sb.ToString();
+    }
+
+    private static uint ReadU32BE(byte[] data, ref int pos)
+    {
+        if (pos + 4 > data.Length) throw new EndOfStreamException();
+        uint v = ((uint)data[pos] << 24) | ((uint)data[pos + 1] << 16) | ((uint)data[pos + 2] << 8) | data[pos + 3];
+        pos += 4;
+        return v;
+    }
+
+    private static long ReadI64BE(byte[] data, ref int pos)
+    {
+        if (pos + 8 > data.Length) throw new EndOfStreamException();
+        long v = 0;
+        for (int i = 0; i < 8; i++) v = (v << 8) | data[pos + i];
+        pos += 8;
+        return v;
+    }
+
+    private static double ShannonEntropy(byte[] data, int offset, int length)
+    {
+        if (length <= 0) return 0;
+        Span<int> freq = stackalloc int[256];
+        for (int i = 0; i < length; i++) freq[data[offset + i]]++;
+        double h = 0;
+        for (int i = 0; i < 256; i++)
+        {
+            if (freq[i] == 0) continue;
+            double p = (double)freq[i] / length;
+            h -= p * Math.Log2(p);
+        }
+        return h;
+    }
+
+    private static List<(int offset, string text)> ExtractStrings(byte[] data, int minLen, int maxOutput)
+    {
+        var result = new List<(int, string)>();
+        int start = -1;
+        for (int i = 0; i < data.Length; i++)
+        {
+            byte b = data[i];
+            bool printable = b >= 0x20 && b < 0x7F;
+            if (printable && start < 0) start = i;
+            else if (!printable && start >= 0)
+            {
+                int len = i - start;
+                if (len >= minLen)
+                {
+                    result.Add((start, System.Text.Encoding.ASCII.GetString(data, start, len)));
+                    if (result.Count >= maxOutput) return result;
+                }
+                start = -1;
+            }
+        }
+        if (start >= 0 && data.Length - start >= minLen)
+            result.Add((start, System.Text.Encoding.ASCII.GetString(data, start, data.Length - start)));
+        return result;
+    }
+
+    private static int IndexOfPattern(byte[] haystack, byte[] needle)
+    {
+        for (int i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < needle.Length; j++)
+                if (haystack[i + j] != needle[j]) { match = false; break; }
+            if (match) return i;
+        }
+        return -1;
+    }
+
+    private static void HexDump(byte[] data, int offset, int length)
+    {
+        for (int i = 0; i < length; i += 16)
+        {
+            var sb = new StringBuilder();
+            sb.Append($"{offset + i:X8}: ");
+            int row = Math.Min(16, length - i);
+            for (int j = 0; j < 16; j++)
+            {
+                if (j < row) sb.Append($"{data[offset + i + j]:x2}");
+                else sb.Append("  ");
+                if (j == 7) sb.Append(' ');
+                sb.Append(' ');
+            }
+            sb.Append(' ');
+            for (int j = 0; j < row; j++)
+            {
+                byte b = data[offset + i + j];
+                sb.Append(b >= 0x20 && b < 0x7F ? (char)b : '.');
+            }
+            Console.WriteLine(sb.ToString());
+        }
+    }
+
+    private static string Escape(string s)
+    {
+        var sb = new StringBuilder();
+        foreach (char c in s)
+        {
+            if (c >= 0x20 && c < 0x7F) sb.Append(c);
+            else sb.Append($"\\x{(int)c:X2}");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
     /// Sanity-check pipeline: extracts up to N bundles into a tmpfs scratch dir,
     /// loads them via AnimeStudio.AssetsManager (Stage 2 + 3), and prints
     /// Texture2D names matching --names regex.
@@ -1388,6 +2046,12 @@ internal static class Program
         bool noChunkBatching = false;   // 默认按 chunk 分批
         bool excludeMaterial = false;   // 排除材质贴图（T_ 前缀的 PBR 槽位贴图）
         bool classify = false;          // 按类型分目录输出
+        double memWatchPercent = 0.9;   // RSS 超过 max-memory-gb × 此比例 触发阀门
+        string diagLogPath = "oom-diagnostic.log";
+        bool memWatchDisabled = false;
+        long perBundleAllocTrapMb = 0;  // 单个 bundle 处理后 GC 分配增量 > 此 MB 就 copy 到 trap dir (0=禁用)
+        string trapDir = "oom-trap-bundles";
+        long perBundleAllocLimitMb = 512;  // 单个 bundle 线程分配硬上限 MB (默认 512，防 OOM)
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -1412,6 +2076,12 @@ internal static class Program
                 case "--no-chunk-batching": noChunkBatching = true; break;
                 case "--exclude-material": excludeMaterial = true; break;
                 case "--classify": classify = true; break;
+                case "--mem-watch-percent": memWatchPercent = double.Parse(RequireValue(args, ref i, a), CultureInfo.InvariantCulture); break;
+                case "--diagnostic-log": diagLogPath = RequireValue(args, ref i, a); break;
+                case "--no-mem-watch": memWatchDisabled = true; break;
+                case "--trap-bundle-alloc-mb": perBundleAllocTrapMb = long.Parse(RequireValue(args, ref i, a)); break;
+                case "--trap-dir": trapDir = RequireValue(args, ref i, a); break;
+                case "--per-bundle-alloc-limit-mb": perBundleAllocLimitMb = long.Parse(RequireValue(args, ref i, a)); break;
                 default: throw new ArgumentException($"Unknown argument: {a}");
             }
         }
@@ -1450,8 +2120,8 @@ internal static class Program
                     CompressionLevel = pngCompression switch
                     {
                         "fast" => PngCompressionLevel.BestSpeed,
-                        "default" => PngCompressionLevel.DefaultCompression,
-                        _ => PngCompressionLevel.NoCompression,
+                        "none" => PngCompressionLevel.NoCompression,
+                        _ => PngCompressionLevel.DefaultCompression,
                     },
                 };
                 ext = ".png";
@@ -1462,6 +2132,9 @@ internal static class Program
 
         Directory.CreateDirectory(outPath);
         Directory.CreateDirectory(scratch);
+        if (perBundleAllocTrapMb > 0) Directory.CreateDirectory(trapDir);
+        long perBundleAllocTrapBytes = perBundleAllocTrapMb * 1024L * 1024L;
+        long trappedBundleCount = 0;
 
         var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
         var bundleRx = bundleNameRegex is null ? null : new Regex(bundleNameRegex, RegexOptions.Compiled);
@@ -1528,6 +2201,84 @@ internal static class Program
 
         // 跨 batch 的文件名占位表，防止重名纹理互相覆盖
         var claimedNames = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+
+        // ── 内存阀门 & 诊断采样 ──
+        long memWatchThresholdBytes = (long)(maxMemoryBytes * memWatchPercent);
+        var killSwitch = new CancellationTokenSource();
+        var memSamples = new ConcurrentQueue<(DateTime ts, long rssBytes, long gcHeapBytes, int channelBacklog, long bundlesDone)>();
+        const int MaxMemSamples = 600;  // 保留最近 ~2 分钟（200ms 采样）
+        var recentBundles = new System.Collections.Concurrent.ConcurrentQueue<(DateTime ts, string name, long size, double decodeMs, int threadId)>();
+        const int RecentBundleCap = 200;
+        int currentChannelBacklog = 0;
+        long lastTriggerRss = 0;
+        string? triggeredBy = null;
+        int memTripCount = 0;
+        long perBundleAllocLimitBytes = perBundleAllocLimitMb * 1024L * 1024L;
+        long bundleAllocBlocked = 0;
+
+        void RecordBundle(string name, long size, double ms, int tid)
+        {
+            recentBundles.Enqueue((DateTime.UtcNow, name, size, ms, tid));
+            while (recentBundles.Count > RecentBundleCap)
+                recentBundles.TryDequeue(out _);
+        }
+
+        var memWatchCts = new CancellationTokenSource();
+        var memWatchTask = Task.Run(async () =>
+        {
+            using var proc = Process.GetCurrentProcess();
+            long lastRss = 0;
+            int consecutiveJumps = 0;
+            const long JUMP_BYTES = 2_000_000_000L;  // 单次采样涨 2GB 视为暴涨
+            while (!memWatchCts.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    proc.Refresh();
+                    long rss = proc.WorkingSet64;
+                    long gcHeap = GC.GetTotalMemory(forceFullCollection: false);
+                    long done = Interlocked.Read(ref bundlesProcessed);
+                    int backlog = Volatile.Read(ref currentChannelBacklog);
+
+                    memSamples.Enqueue((DateTime.UtcNow, rss, gcHeap, backlog, done));
+                    while (memSamples.Count > MaxMemSamples) memSamples.TryDequeue(out _);
+
+                    if (memWatchDisabled) { lastRss = rss; }
+                    else
+                    {
+                        // 触发条件 1：RSS 超过阈值
+                        if (rss > memWatchThresholdBytes && triggeredBy == null)
+                        {
+                            triggeredBy = $"RSS exceeded threshold: {rss / 1e9:F2} GB > {memWatchThresholdBytes / 1e9:F2} GB (max={maxMemoryGb} GB × {memWatchPercent:P0})";
+                            lastTriggerRss = rss;
+                            Interlocked.Increment(ref memTripCount);
+                            killSwitch.Cancel();
+                        }
+                        // 触发条件 2：单次采样涨幅 > JUMP_BYTES，连续 2 次（200ms 间隔→400ms 内涨 4GB）
+                        else if (lastRss > 0 && rss - lastRss > JUMP_BYTES)
+                        {
+                            consecutiveJumps++;
+                            if (consecutiveJumps >= 2 && triggeredBy == null)
+                            {
+                                triggeredBy = $"RSS surge detected: {(rss - lastRss) / 1e9:F2} GB per 200ms, sustained {consecutiveJumps} samples; current RSS={rss / 1e9:F2} GB";
+                                lastTriggerRss = rss;
+                                Interlocked.Increment(ref memTripCount);
+                                killSwitch.Cancel();
+                            }
+                        }
+                        else
+                        {
+                            consecutiveJumps = 0;
+                        }
+                        lastRss = rss;
+                    }
+
+                    await Task.Delay(200, memWatchCts.Token);
+                }
+                catch (TaskCanceledException) { break; }
+                catch { /* keep watching */ }
+            }
+        });
 
         // ── Progress task (global) ──
         bool progressEnabled = !Console.IsErrorRedirected;
@@ -1597,6 +2348,7 @@ internal static class Program
                 {
                     foreach (var (bt, chunk, file) in batch)
                     {
+                        if (killSwitch.IsCancellationRequested) break;
                         string baseName = Path.GetFileName(file.FileName);
                         string outBundle = Path.Combine(scratch, baseName);
                         using (var fs = new FileStream(outBundle, FileMode.Create, FileAccess.Write,
@@ -1606,7 +2358,12 @@ internal static class Program
                         }
                         Interlocked.Increment(ref stage1Extracted);
                         Interlocked.Add(ref totalBytes, file.Length);
-                        await bundleChannel.Writer.WriteAsync((outBundle, file.Length));
+                        try
+                        {
+                            await bundleChannel.Writer.WriteAsync((outBundle, file.Length), killSwitch.Token);
+                            Interlocked.Increment(ref currentChannelBacklog);
+                        }
+                        catch (OperationCanceledException) { break; }
                     }
                 }
                 finally
@@ -1625,26 +2382,63 @@ internal static class Program
                     {
                         Game = AS.GameManager.GetGame(AS.GameType.ArknightsEndfield),
                         Silent = true,
-                        SkipProcess = false,
+                        SkipProcess = true,  // 不自动 ReadAssets，避免 AnimatorController 等构造时 OOM
                     };
+                    // 将 per-bundle alloc limit 传入 SerializedFile 解析层，
+                    // 在解析过程中超限就立即抛 IOException 中断（而不是等 LoadFiles 返回后才发现）
+                    if (perBundleAllocLimitBytes > 0)
+                        mgr.PerFileAllocBudgetBytes = perBundleAllocLimitBytes;
 
                     int localCount = 0;
-                    await foreach (var (bundlePath, _) in bundleChannel.Reader.ReadAllAsync())
+                    await foreach (var (bundlePath, bundleSize) in bundleChannel.Reader.ReadAllAsync())
                     {
+                        Interlocked.Decrement(ref currentChannelBacklog);
+                        if (killSwitch.IsCancellationRequested) break;
+                        var swBundle = Stopwatch.StartNew();
+                        long allocBefore = (perBundleAllocTrapBytes > 0 || perBundleAllocLimitBytes > 0)
+                            ? GC.GetAllocatedBytesForCurrentThread()
+                            : 0;
                         try
                         {
                             mgr.LoadFiles(bundlePath);
 
+                            long deltaLoad = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+
+                            // ── Per-bundle alloc 硬限制：LoadFiles 后检查线程分配量 ──
+                            if (perBundleAllocLimitBytes > 0)
+                            {
+                                long allocDelta = deltaLoad;
+                                if (allocDelta > perBundleAllocLimitBytes)
+                                {
+                                    Interlocked.Increment(ref bundleAllocBlocked);
+                                    Console.Error.WriteLine($"  BLOCKED: {Path.GetFileName(bundlePath)} alloc={allocDelta / 1024 / 1024}MB > limit={perBundleAllocLimitMb}MB, skipping decode");
+                                    // 强制 GC 释放该 bundle 的内存
+                                    mgr.Clear();
+                                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                                    continue;
+                                }
+                            }
+
                             foreach (var sf in mgr.assetsFileList)
                             {
-                                foreach (var obj in sf.Objects)
+                                // SkipProcess=true 时 Objects 为空，需要手动从 m_Objects 构造目标类型
+                                // 只构造 Texture2D，跳过 AnimatorController 等可能 OOM 的类型
+                                foreach (var objectInfo in sf.m_Objects)
                                 {
                                     Interlocked.Increment(ref objectsScanned);
 
-                                    if (!typeFilters.Contains(obj.GetType().Name)) continue;
+                                    if (objectInfo.classID != (int)AS.ClassIDType.Texture2D) continue;
 
-                                    if (obj is AS.Texture2D tex)
+                                    AS.Texture2D tex;
+                                    try
                                     {
+                                        var objectReader = new AS.ObjectReader(sf.reader, sf, objectInfo, mgr.Game);
+                                        tex = new AS.Texture2D(objectReader);
+                                    }
+                                    catch (Exception)
+                                    {
+                                        continue;
+                                    }
                                         string name = tex.m_Name ?? "";
                                         if (assetRx != null && !assetRx.IsMatch(name)) continue;
 
@@ -1704,11 +2498,21 @@ internal static class Program
                                         {
                                             Interlocked.Increment(ref texturesDecodeFailed);
                                         }
-                                    }
                                 }
                             }
 
                             Interlocked.Increment(ref bundlesProcessed);
+                        }
+                        catch (AS.AllocBudgetExceededException abex)
+                        {
+                            // 解析过程中预算超限——从 LoadFiles 内部抛出，内存尚未完全爆炸
+                            Interlocked.Increment(ref bundleAllocBlocked);
+                            long allocDelta = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+                            Console.Error.WriteLine($"  BLOCKED (early): {Path.GetFileName(bundlePath)} alloc={allocDelta / 1024 / 1024}MB > limit={perBundleAllocLimitMb}MB");
+                            Console.Error.WriteLine($"    → triggered at: {abex.FileName}");
+                            mgr.Clear();
+                            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                            continue;
                         }
                         catch (Exception ex)
                         {
@@ -1718,7 +2522,35 @@ internal static class Program
                         finally
                         {
                             mgr.Clear();
-                            if (!keepBundles)
+                            swBundle.Stop();
+                            RecordBundle(Path.GetFileName(bundlePath), bundleSize, swBundle.Elapsed.TotalMilliseconds, Environment.CurrentManagedThreadId);
+
+                            // ── Trap：单 bundle 分配增量超阈值 → 拷贝到 trap dir ──
+                            if (perBundleAllocTrapBytes > 0)
+                            {
+                                long allocAfter = GC.GetAllocatedBytesForCurrentThread();
+                                long delta = allocAfter - allocBefore;
+                                if (delta > perBundleAllocTrapBytes)
+                                {
+                                    try
+                                    {
+                                        string trapName = $"alloc{delta / 1024 / 1024}MB_dur{(long)swBundle.Elapsed.TotalMilliseconds}ms_{Path.GetFileName(bundlePath)}";
+                                        string trapPath = Path.Combine(trapDir, trapName);
+                                        File.Copy(bundlePath, trapPath, overwrite: true);
+                                        Interlocked.Increment(ref trappedBundleCount);
+                                        Console.Error.WriteLine();
+                                        Console.Error.WriteLine($"  TRAPPED: {Path.GetFileName(bundlePath)} alloc={delta / 1024 / 1024}MB dur={(long)swBundle.Elapsed.TotalMilliseconds}ms → {trapPath}");
+                                    }
+                                    catch (Exception copyEx)
+                                    {
+                                        Console.Error.WriteLine($"  TRAP copy failed: {copyEx.Message}");
+                                    }
+                                }
+                            }
+
+                            // 阀门触发或正常运行：决定是否保留 bundle
+                            bool keepThisBundle = keepBundles || killSwitch.IsCancellationRequested;
+                            if (!keepThisBundle)
                             {
                                 try { File.Delete(bundlePath); } catch { /* ignore */ }
                             }
@@ -1742,22 +2574,51 @@ internal static class Program
             await producer;
 
             // Between batches: scratch cleanup + LOH compact GC
-            if (!keepBundles)
+            if (!keepBundles && !killSwitch.IsCancellationRequested)
             {
                 try { foreach (var f in Directory.GetFiles(scratch)) File.Delete(f); } catch { }
             }
             GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
             GC.WaitForPendingFinalizers();
+
+            if (killSwitch.IsCancellationRequested)
+            {
+                // 阀门触发：停止后续 batch
+                break;
+            }
         }
 
-        // Stop progress, print final line
+        // Stop progress + memwatch, print final line
         progressCts.Cancel();
+        memWatchCts.Cancel();
         try { await progressTask; } catch { }
+        try { await memWatchTask; } catch { }
         if (progressEnabled)
         {
             PrintProgress(totalCandidates, stage1Extracted, bundlesProcessed, totalBytes);
             Console.Error.WriteLine();
+        }
+
+        // 如果触发了内存阀门，写诊断日志
+        if (triggeredBy != null)
+        {
+            try
+            {
+                WriteOomDiagnostic(
+                    diagLogPath, triggeredBy, lastTriggerRss, maxMemoryGb, memWatchPercent,
+                    swTotal, bundlesProcessed, bundlesFailed, stage1Extracted, totalCandidates,
+                    pngWritten, texturesMatched, texturesDecodeFailed,
+                    threads, currentChannelBacklog,
+                    memSamples, recentBundles);
+                Console.Error.WriteLine();
+                Console.Error.WriteLine($"!! MEMORY WATCHDOG TRIPPED: {triggeredBy}");
+                Console.Error.WriteLine($"!! Diagnostic written to: {Path.GetFullPath(diagLogPath)}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"!! Failed to write diagnostic log: {ex.Message}");
+            }
         }
 
         swTotal.Stop();
@@ -1778,9 +2639,15 @@ internal static class Program
             $"  decode/save failed      = {texturesDecodeFailed:#,0}");
         Console.WriteLine(
             $"  max-memory-gb           = {maxMemoryGb}");
+        if (perBundleAllocTrapMb > 0)
+            Console.WriteLine(
+            $"  trapped bundles         = {trappedBundleCount:#,0}  ({Path.GetFullPath(trapDir)})");
+        if (perBundleAllocLimitMb > 0)
+            Console.WriteLine(
+            $"  blocked (alloc limit)   = {bundleAllocBlocked:#,0}  (limit={perBundleAllocLimitMb} MB/bundle)");
         Console.WriteLine(
             $"  total wall              = {swTotal.Elapsed.TotalSeconds:F2} s");
-        return 0;
+        return triggeredBy != null ? 3 : 0;
     }
 
     private static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
@@ -1930,6 +2797,92 @@ internal static class Program
         if (lower.StartsWith("map02") || lower.StartsWith("map03")) return "map";
 
         return "other";
+    }
+
+    /// <summary>
+    /// 写 OOM 触发时的诊断快照：触发原因、计数器、最近 N 个 bundle 处理记录、内存采样曲线。
+    /// </summary>
+    private static void WriteOomDiagnostic(
+        string logPath,
+        string triggeredBy,
+        long lastTriggerRss,
+        int maxMemoryGb,
+        double memWatchPercent,
+        Stopwatch swTotal,
+        long bundlesProcessed,
+        long bundlesFailed,
+        int stage1Extracted,
+        long totalCandidates,
+        long pngWritten,
+        long texturesMatched,
+        long texturesDecodeFailed,
+        int threads,
+        int currentChannelBacklog,
+        ConcurrentQueue<(DateTime ts, long rssBytes, long gcHeapBytes, int channelBacklog, long bundlesDone)> memSamples,
+        ConcurrentQueue<(DateTime ts, string name, long size, double decodeMs, int threadId)> recentBundles)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("════════════════════════════════════════════════════════════════");
+        sb.AppendLine("  ENDFIELD-DUMP MEMORY WATCHDOG DIAGNOSTIC");
+        sb.AppendLine("════════════════════════════════════════════════════════════════");
+        sb.AppendLine($"Timestamp:       {DateTime.UtcNow:O}");
+        sb.AppendLine($"Triggered by:    {triggeredBy}");
+        sb.AppendLine($"Trigger RSS:     {lastTriggerRss / 1e9:F2} GB");
+        sb.AppendLine($"Threshold:       max-memory-gb={maxMemoryGb} × percent={memWatchPercent:P0} = {maxMemoryGb * memWatchPercent:F2} GB");
+        sb.AppendLine($"Wall elapsed:    {swTotal.Elapsed.TotalSeconds:F2} s");
+        sb.AppendLine();
+        sb.AppendLine("── Counters ──────────────────────────────────────────────────");
+        sb.AppendLine($"  threads (cli)         = {threads}");
+        sb.AppendLine($"  totalCandidates       = {totalCandidates:#,0}");
+        sb.AppendLine($"  stage1 extracted      = {stage1Extracted:#,0}  ({(totalCandidates > 0 ? stage1Extracted * 100.0 / totalCandidates : 0):F1}%)");
+        sb.AppendLine($"  bundlesProcessed      = {bundlesProcessed:#,0}  ({(totalCandidates > 0 ? bundlesProcessed * 100.0 / totalCandidates : 0):F1}%)");
+        sb.AppendLine($"  bundlesFailed         = {bundlesFailed:#,0}");
+        sb.AppendLine($"  channelBacklog (now)  = {currentChannelBacklog}");
+        sb.AppendLine($"  texturesMatched       = {texturesMatched:#,0}");
+        sb.AppendLine($"  texturesDecodeFailed  = {texturesDecodeFailed:#,0}");
+        sb.AppendLine($"  pngWritten            = {pngWritten:#,0}");
+        sb.AppendLine();
+
+        // 内存采样（最后 60 个，每秒一次）
+        var samples = memSamples.ToArray();
+        int sampleTake = Math.Min(60, samples.Length);
+        sb.AppendLine($"── Memory samples (last {sampleTake} of {samples.Length}, 1s interval) ──");
+        sb.AppendLine($"  {"timestamp",-30}  {"RSS_GB",10}  {"GCheap_GB",10}  {"backlog",8}  {"bundlesDone",12}");
+        foreach (var s in samples.Skip(Math.Max(0, samples.Length - sampleTake)))
+        {
+            sb.AppendLine($"  {s.ts:HH:mm:ss.fff,-30}  {s.rssBytes / 1e9,10:F3}  {s.gcHeapBytes / 1e9,10:F3}  {s.channelBacklog,8}  {s.bundlesDone,12:#,0}");
+        }
+        sb.AppendLine();
+
+        // 最近处理的 bundle（按耗时倒序 top 30 + 按时间倒序 top 50）
+        var bundles = recentBundles.ToArray();
+        sb.AppendLine($"── Last {bundles.Length} processed bundles (top 30 SLOWEST) ──");
+        sb.AppendLine($"  {"decode_ms",10}  {"size_MB",10}  {"tid",5}  {"timestamp",-25}  name");
+        foreach (var b in bundles.OrderByDescending(x => x.decodeMs).Take(30))
+        {
+            sb.AppendLine($"  {b.decodeMs,10:F1}  {b.size / 1024.0 / 1024.0,10:F2}  {b.threadId,5}  {b.ts:HH:mm:ss.fff,-25}  {b.name}");
+        }
+        sb.AppendLine();
+
+        sb.AppendLine($"── Last {Math.Min(50, bundles.Length)} processed bundles (by time, newest first) ──");
+        sb.AppendLine($"  {"timestamp",-25}  {"decode_ms",10}  {"size_MB",10}  {"tid",5}  name");
+        foreach (var b in bundles.OrderByDescending(x => x.ts).Take(50))
+        {
+            sb.AppendLine($"  {b.ts:HH:mm:ss.fff,-25}  {b.decodeMs,10:F1}  {b.size / 1024.0 / 1024.0,10:F2}  {b.threadId,5}  {b.name}");
+        }
+        sb.AppendLine();
+
+        // 大小排行（top 30）
+        sb.AppendLine($"── Last {bundles.Length} processed bundles (top 30 LARGEST) ──");
+        sb.AppendLine($"  {"size_MB",10}  {"decode_ms",10}  {"tid",5}  {"timestamp",-25}  name");
+        foreach (var b in bundles.OrderByDescending(x => x.size).Take(30))
+        {
+            sb.AppendLine($"  {b.size / 1024.0 / 1024.0,10:F2}  {b.decodeMs,10:F1}  {b.threadId,5}  {b.ts:HH:mm:ss.fff,-25}  {b.name}");
+        }
+        sb.AppendLine();
+
+        sb.AppendLine("════════════════════════════════════════════════════════════════");
+        File.WriteAllText(logPath, sb.ToString());
     }
 
     /// <summary>

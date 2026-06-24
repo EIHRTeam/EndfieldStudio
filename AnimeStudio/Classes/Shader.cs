@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
@@ -28,14 +28,14 @@ namespace AnimeStudio
             var m_ArraySize = reader.ReadInt32();
             var m_StructSize = reader.ReadInt32();
 
-            int numVectorParams = reader.ReadInt32();
+            int numVectorParams = reader.ReadInt32Clamped(1_000_000);
             m_VectorParams = new List<VectorParameter>();
             for (int i = 0; i < numVectorParams; i++)
             {
                 m_VectorParams.Add(new VectorParameter(reader));
             }
 
-            int numMatrixParams = reader.ReadInt32();
+            int numMatrixParams = reader.ReadInt32Clamped(1_000_000);
             m_MatrixParams = new List<MatrixParameter>();
             for (int i = 0; i < numMatrixParams; i++)
             {
@@ -55,7 +55,7 @@ namespace AnimeStudio
             bindPoint = reader.ReadInt32();
         }
     }
-    
+
     public class DescriptorSetParam
     {
         public int m_NameIndex;
@@ -69,7 +69,7 @@ namespace AnimeStudio
             m_SetId = reader.ReadInt32();
             m_MaxBindingIndex = reader.ReadInt32();
 
-            var numSetBindings = reader.ReadInt32();
+            var numSetBindings = reader.ReadInt32Clamped(1_000_000);
             m_SetBindings = new List<SetBinding>();
             for (int i = 0; i < numSetBindings; i++)
             {
@@ -172,7 +172,7 @@ namespace AnimeStudio
 
         public SerializedProperties(EndianBinaryReader reader)
         {
-            int numProps = reader.ReadInt32();
+            int numProps = reader.ReadInt32Clamped(1_000_000);
             m_Props = new List<SerializedProperty>();
             for (int i = 0; i < numProps; i++)
             {
@@ -329,7 +329,7 @@ namespace AnimeStudio
             m_LOD = reader.ReadInt32();
             if (reader.Game.Type.IsLoveAndDeepspace())
             {
-                int numOverrideKeywordAndStage = reader.ReadInt32();
+                int numOverrideKeywordAndStage = reader.ReadInt32Clamped(1_000_000);
                 var m_OverrideKeywordAndStage = new List<KeyValuePair<string, uint>>();
                 for (int i = 0; i < numOverrideKeywordAndStage; i++)
                 {
@@ -360,7 +360,7 @@ namespace AnimeStudio
 
         public ParserBindChannels(EndianBinaryReader reader)
         {
-            int numChannels = reader.ReadInt32();
+            int numChannels = reader.ReadInt32Clamped(1_000_000);
             m_Channels = new List<ShaderBindChannel>();
             for (int i = 0; i < numChannels; i++)
             {
@@ -485,14 +485,14 @@ namespace AnimeStudio
 
             m_NameIndex = reader.ReadInt32();
 
-            int numMatrixParams = reader.ReadInt32();
+            int numMatrixParams = reader.ReadInt32Clamped(1_000_000);
             m_MatrixParams = new List<MatrixParameter>();
             for (int i = 0; i < numMatrixParams; i++)
             {
                 m_MatrixParams.Add(new MatrixParameter(reader));
             }
 
-            int numVectorParams = reader.ReadInt32();
+            int numVectorParams = reader.ReadInt32Clamped(1_000_000);
             m_VectorParams = new List<VectorParameter>();
             for (int i = 0; i < numVectorParams; i++)
             {
@@ -500,7 +500,7 @@ namespace AnimeStudio
             }
             if (version[0] > 2017 || (version[0] == 2017 && version[1] >= 3)) //2017.3 and up
             {
-                int numStructParams = reader.ReadInt32();
+                int numStructParams = reader.ReadInt32Clamped(1_000_000);
                 m_StructParams = new List<StructParameter>();
                 for (int i = 0; i < numStructParams; i++)
                 {
@@ -586,56 +586,56 @@ namespace AnimeStudio
 
         public SerializedProgramParameters(ObjectReader reader)
         {
-            int numVectorParams = reader.ReadInt32();
+            int numVectorParams = reader.ReadInt32Clamped(1_000_000);
             m_VectorParams = new List<VectorParameter>();
             for (int i = 0; i < numVectorParams; i++)
             {
                 m_VectorParams.Add(new VectorParameter(reader));
             }
 
-            int numMatrixParams = reader.ReadInt32();
+            int numMatrixParams = reader.ReadInt32Clamped(1_000_000);
             m_MatrixParams = new List<MatrixParameter>();
             for (int i = 0; i < numMatrixParams; i++)
             {
                 m_MatrixParams.Add(new MatrixParameter(reader));
             }
 
-            int numTextureParams = reader.ReadInt32();
+            int numTextureParams = reader.ReadInt32Clamped(1_000_000);
             m_TextureParams = new List<TextureParameter>();
             for (int i = 0; i < numTextureParams; i++)
             {
                 m_TextureParams.Add(new TextureParameter(reader));
             }
 
-            int numBufferParams = reader.ReadInt32();
+            int numBufferParams = reader.ReadInt32Clamped(1_000_000);
             m_BufferParams = new List<BufferBinding>();
             for (int i = 0; i < numBufferParams; i++)
             {
                 m_BufferParams.Add(new BufferBinding(reader));
             }
 
-            int numConstantBuffers = reader.ReadInt32();
+            int numConstantBuffers = reader.ReadInt32Clamped(1_000_000);
             m_ConstantBuffers = new List<ConstantBuffer>();
             for (int i = 0; i < numConstantBuffers; i++)
             {
                 m_ConstantBuffers.Add(new ConstantBuffer(reader));
             }
 
-            int numConstantBufferBindings = reader.ReadInt32();
+            int numConstantBufferBindings = reader.ReadInt32Clamped(1_000_000);
             m_ConstantBufferBindings = new List<BufferBinding>();
             for (int i = 0; i < numConstantBufferBindings; i++)
             {
                 m_ConstantBufferBindings.Add(new BufferBinding(reader));
             }
 
-            int numUAVParams = reader.ReadInt32();
+            int numUAVParams = reader.ReadInt32Clamped(1_000_000);
             m_UAVParams = new List<UAVParameter>();
             for (int i = 0; i < numUAVParams; i++)
             {
                 m_UAVParams.Add(new UAVParameter(reader));
             }
 
-            int numSamplers = reader.ReadInt32();
+            int numSamplers = reader.ReadInt32Clamped(1_000_000);
             m_Samplers = new List<SamplerParameter>();
             for (int i = 0; i < numSamplers; i++)
             {
@@ -644,7 +644,7 @@ namespace AnimeStudio
 
             if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
             {
-                int numDescriptorSetParams = reader.ReadInt32();
+                int numDescriptorSetParams = reader.ReadInt32Clamped(1_000_000);
                 m_DescriptorSetParams = new List<DescriptorSetParam>();
                 for (int i = 0; i < numDescriptorSetParams; i++)
                 {
@@ -679,7 +679,7 @@ namespace AnimeStudio
         public SerializedSubProgram(ObjectReader reader)
         {
             var version = reader.version;
-            
+
             if (reader.Game.Type.IsLoveAndDeepspace())
             {
                 var m_CodeHash = new Hash128(reader);
@@ -743,49 +743,49 @@ namespace AnimeStudio
             {
                 try
                 {
-                    int numVectorParams = reader.ReadInt32();
+                    int numVectorParams = reader.ReadInt32Clamped(1_000_000);
                     m_VectorParams = new List<VectorParameter>();
                     for (int i = 0; i < numVectorParams; i++)
                     {
                         m_VectorParams.Add(new VectorParameter(reader));
                     }
 
-                    int numMatrixParams = reader.ReadInt32();
+                    int numMatrixParams = reader.ReadInt32Clamped(1_000_000);
                     m_MatrixParams = new List<MatrixParameter>();
                     for (int i = 0; i < numMatrixParams; i++)
                     {
                         m_MatrixParams.Add(new MatrixParameter(reader));
                     }
 
-                    int numTextureParams = reader.ReadInt32();
+                    int numTextureParams = reader.ReadInt32Clamped(1_000_000);
                     m_TextureParams = new List<TextureParameter>();
                     for (int i = 0; i < numTextureParams; i++)
                     {
                         m_TextureParams.Add(new TextureParameter(reader));
                     }
 
-                    int numBufferParams = reader.ReadInt32();
+                    int numBufferParams = reader.ReadInt32Clamped(1_000_000);
                     m_BufferParams = new List<BufferBinding>();
                     for (int i = 0; i < numBufferParams; i++)
                     {
                         m_BufferParams.Add(new BufferBinding(reader));
                     }
 
-                    int numConstantBuffers = reader.ReadInt32();
+                    int numConstantBuffers = reader.ReadInt32Clamped(1_000_000);
                     m_ConstantBuffers = new List<ConstantBuffer>();
                     for (int i = 0; i < numConstantBuffers; i++)
                     {
                         m_ConstantBuffers.Add(new ConstantBuffer(reader));
                     }
 
-                    int numConstantBufferBindings = reader.ReadInt32();
+                    int numConstantBufferBindings = reader.ReadInt32Clamped(1_000_000);
                     m_ConstantBufferBindings = new List<BufferBinding>();
                     for (int i = 0; i < numConstantBufferBindings; i++)
                     {
                         m_ConstantBufferBindings.Add(new BufferBinding(reader));
                     }
 
-                    int numUAVParams = reader.ReadInt32();
+                    int numUAVParams = reader.ReadInt32Clamped(1_000_000);
                     m_UAVParams = new List<UAVParameter>();
                     for (int i = 0; i < numUAVParams; i++)
                     {
@@ -794,7 +794,7 @@ namespace AnimeStudio
 
                     if (version[0] >= 2017) //2017 and up
                     {
-                        int numSamplers = reader.ReadInt32();
+                        int numSamplers = reader.ReadInt32Clamped(1_000_000);
                         m_Samplers = new List<SamplerParameter>();
                         for (int i = 0; i < numSamplers; i++)
                         {
@@ -824,7 +824,7 @@ namespace AnimeStudio
 
                 if (HasInstancedStructuredBuffers(reader.serializedType))
                 {
-                    int numInstancedStructuredBuffers = reader.ReadInt32();
+                    int numInstancedStructuredBuffers = reader.ReadInt32Clamped(1_000_000);
                     var m_InstancedStructuredBuffers = new List<ConstantBuffer>();
                     for (int i = 0; i < numInstancedStructuredBuffers; i++)
                     {
@@ -872,7 +872,7 @@ namespace AnimeStudio
                 return;
             }
 
-            int numSubPrograms = reader.ReadInt32();
+            int numSubPrograms = reader.ReadInt32Clamped(1_000_000);
             m_SubPrograms = new List<SerializedSubProgram>();
             for (int i = 0; i < numSubPrograms; i++)
             {
@@ -884,12 +884,12 @@ namespace AnimeStudio
                (version[0] == 2022 && version[1] > 1) ||
                version[0] == 2022 && version[1] == 1 && version[2] >= 13) //2022.1.13f1 and up
             {
-                int numPlayerSubPrograms = reader.ReadInt32();
+                int numPlayerSubPrograms = reader.ReadInt32Clamped(1_000_000);
                 m_PlayerSubPrograms = new List<List<SerializedPlayerSubProgram>>();
                 for (int i = 0; i < numPlayerSubPrograms; i++)
                 {
                     m_PlayerSubPrograms.Add(new List<SerializedPlayerSubProgram>());
-                    int numPlatformPrograms = reader.ReadInt32();
+                    int numPlatformPrograms = reader.ReadInt32Clamped(1_000_000);
                     for (int j = 0; j < numPlatformPrograms; j++)
                     {
                         m_PlayerSubPrograms[i].Add(new SerializedPlayerSubProgram(reader));
@@ -952,7 +952,7 @@ namespace AnimeStudio
 
             if (version[0] > 2020 || (version[0] == 2020 && version[1] >= 2)) //2020.2 and up
             {
-                int numEditorDataHash = reader.ReadInt32();
+                int numEditorDataHash = reader.ReadInt32Clamped(1_000_000);
                 m_EditorDataHash = new List<Hash128>();
                 for (int i = 0; i < numEditorDataHash; i++)
                 {
@@ -970,7 +970,7 @@ namespace AnimeStudio
                 }
             }
 
-            int numIndices = reader.ReadInt32();
+            int numIndices = reader.ReadInt32Clamped(10_000_000);
             m_NameIndices = new List<KeyValuePair<string, int>>();
             for (int i = 0; i < numIndices; i++)
             {
@@ -1022,7 +1022,7 @@ namespace AnimeStudio
 
         public SerializedTagMap(EndianBinaryReader reader)
         {
-            int numTags = reader.ReadInt32();
+            int numTags = reader.ReadInt32Clamped(1_000_000);
             tags = new List<KeyValuePair<string, string>>();
             for (int i = 0; i < numTags; i++)
             {
@@ -1039,7 +1039,7 @@ namespace AnimeStudio
 
         public SerializedSubShader(ObjectReader reader)
         {
-            int numPasses = reader.ReadInt32();
+            int numPasses = reader.ReadInt32Clamped(1_000_000);
             m_Passes = new List<SerializedPass>();
             for (int i = 0; i < numPasses; i++)
             {
@@ -1095,7 +1095,7 @@ namespace AnimeStudio
 
             m_PropInfo = new SerializedProperties(reader);
 
-            int numSubShaders = reader.ReadInt32();
+            int numSubShaders = reader.ReadInt32Clamped(1_000_000);
             m_SubShaders = new List<SerializedSubShader>();
             for (int i = 0; i < numSubShaders; i++)
             {
@@ -1117,7 +1117,7 @@ namespace AnimeStudio
             m_CustomEditorName = reader.ReadAlignedString();
             m_FallbackName = reader.ReadAlignedString();
 
-            int numDependencies = reader.ReadInt32();
+            int numDependencies = reader.ReadInt32Clamped(1_000_000);
             m_Dependencies = new List<SerializedShaderDependency>();
             for (int i = 0; i < numDependencies; i++)
             {
@@ -1126,7 +1126,7 @@ namespace AnimeStudio
 
             if (version[0] >= 2021) //2021.1 and up
             {
-                int m_CustomEditorForRenderPipelinesSize = reader.ReadInt32();
+                int m_CustomEditorForRenderPipelinesSize = reader.ReadInt32Clamped(1_000_000);
                 m_CustomEditorForRenderPipelines = new List<SerializedCustomEditorForRenderPipeline>();
                 for (int i = 0; i < m_CustomEditorForRenderPipelinesSize; i++)
                 {
@@ -1254,7 +1254,7 @@ namespace AnimeStudio
                     m_SubShaderBinaryDataLODs = reader.ReadInt32Array();
                     reader.AlignStream();
 
-                    int numSubShaderBinaryData = reader.ReadInt32();
+                    int numSubShaderBinaryData = reader.ReadInt32Clamped(1_000_000);
                     m_SubShaderBinaryData = new List<PPtr<SubShaderBinaryData>>();
                     for (int i = 0; i < numSubShaderBinaryData; i++)
                     {
@@ -1265,7 +1265,7 @@ namespace AnimeStudio
                 platforms = reader.ReadUInt32Array().Select(x => (ShaderCompilerPlatform)x).ToArray();
                 if (reader.Game.Type.IsSRGroup())
                 {
-                    int numPlatformInfos = reader.ReadInt32();
+                    int numPlatformInfos = reader.ReadInt32Clamped(10_000);
                     platformInfos = new ShaderPlatformInfos[numPlatformInfos];
 
                     for (int i = 0; i < numPlatformInfos; i++)
@@ -1322,7 +1322,7 @@ namespace AnimeStudio
                     var m_CompressionType = reader.ReadInt32();
                 }
 
-                var m_DependenciesCount = reader.ReadInt32();
+                var m_DependenciesCount = reader.ReadInt32Clamped(1_000_000);
                 for (int i = 0; i < m_DependenciesCount; i++)
                 {
                     new PPtr<Shader>(reader);
@@ -1330,7 +1330,7 @@ namespace AnimeStudio
 
                 if (version[0] >= 2018)
                 {
-                    var m_NonModifiableTexturesCount = reader.ReadInt32();
+                    var m_NonModifiableTexturesCount = reader.ReadInt32Clamped(1_000_000);
                     for (int i = 0; i < m_NonModifiableTexturesCount; i++)
                     {
                         var first = reader.ReadAlignedString();

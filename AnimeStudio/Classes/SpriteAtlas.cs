@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace AnimeStudio
@@ -31,7 +31,7 @@ namespace AnimeStudio
             settingsRaw = new SpriteSettings(reader);
             if (version[0] > 2020 || (version[0] == 2020 && version[1] >= 2)) //2020.2 and up
             {
-                var secondaryTexturesSize = reader.ReadInt32();
+                var secondaryTexturesSize = reader.ReadInt32Clamped(1_000_000);
                 secondaryTextures = new List<SecondarySpriteTexture>();
                 for (int i = 0; i < secondaryTexturesSize; i++)
                 {
@@ -50,7 +50,7 @@ namespace AnimeStudio
 
         public SpriteAtlas(ObjectReader reader) : base(reader)
         {
-            var m_PackedSpritesSize = reader.ReadInt32();
+            var m_PackedSpritesSize = reader.ReadInt32Clamped(1_000_000);
             m_PackedSprites = new List<PPtr<Sprite>>();
             for (int i = 0; i < m_PackedSpritesSize; i++)
             {
@@ -59,7 +59,7 @@ namespace AnimeStudio
 
             var m_PackedSpriteNamesToIndex = reader.ReadStringArray();
 
-            var m_RenderDataMapSize = reader.ReadInt32();
+            var m_RenderDataMapSize = reader.ReadInt32Clamped(1_000_000);
             m_RenderDataMap = new Dictionary<KeyValuePair<Guid, long>, SpriteAtlasData>();
             for (int i = 0; i < m_RenderDataMapSize; i++)
             {
