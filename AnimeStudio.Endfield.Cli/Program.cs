@@ -36,7 +36,7 @@ internal static class Program
                                 [--format wem|wav|mp3] [--block all|audio|initialaudio|auditaudio|voice]
                                 [--vgmstream <path>] [--ffmpeg <path>]
                                 [--mp3-bitrate 192] [--mp3-quality best|high|medium|low|minimum|0-9]
-                                [--threads N]
+                                [--threads N] [--base-vfs <base_streaming_assets>]
           endfield-dump video   --vfs <streaming_assets_path> --out <dir>
                                 [--format mp4|usm] [--block all|video|auditvideo]
                                 [--ffmpeg <path>] [--threads N]
@@ -363,6 +363,7 @@ internal static class Program
         public int? Mp3Vbr;            // VBR 质量等级 0-9（数字越小越好，0≈245kbps, 4≈165kbps, 9≈65kbps）
         public int Threads;
         public Regex? AudioFilter;     // 映射路径正则过滤器（null = 不过滤）
+        public string? BaseVfsPath;    // 基础游戏 StreamingAssets（热更模式下用于回退加载 AudioDialog）
     }
 
     private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice }
@@ -439,6 +440,10 @@ internal static class Program
                 case "--operator-only":
                     // 快捷方式：只提取干员语音
                     parsed.AudioFilter = new Regex(@"Characters/chr_\d+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+                    break;
+                case "--base-vfs":
+                    // 热更模式：基础游戏 StreamingAssets，用于回退加载 AudioDialog 表
+                    parsed.BaseVfsPath = RequireValue(args, ref i, a);
                     break;
                 default:
                     throw new ArgumentException($"Unknown argument: {a}");
@@ -643,28 +648,24 @@ internal static class Program
 
         // 1. 加载 AudioDialog 表（从 Table block）
         Console.WriteLine("Loading AudioDialog table...");
-        string? audioDialogJson = null;
-        try
+        string? audioDialogJson = LoadAudioDialog(loader);
+
+        // 热更模式回退：当前 VFS 里 AudioDialog 缺失（增量数据，chunk 不在）时，
+        // 从基础游戏 StreamingAssets 加载完整 AudioDialog（WEM id 跨版本通常稳定）。
+        if (audioDialogJson == null && !string.IsNullOrEmpty(parsed.BaseVfsPath))
         {
-            var tableInfo = loader.LoadBlockInfo(BlockType.Table);
-            foreach (var chunk in tableInfo.Chunks)
+            Console.WriteLine($"  AudioDialog missing in hot-update, falling back to base game: {parsed.BaseVfsPath}");
+            try
             {
-                foreach (var file in chunk.Files)
-                {
-                    var data = loader.ExtractFileToBytes(BlockType.Table, chunk, file);
-                    var (rootName, json) = SparkBuffer.Parse(data);
-                    if (rootName == "AudioDialog")
-                    {
-                        audioDialogJson = json;
-                        break;
-                    }
-                }
-                if (audioDialogJson != null) break;
+                var baseLoader = new VfsLoader(parsed.BaseVfsPath, Keys.ChaCha20Key);
+                audioDialogJson = LoadAudioDialog(baseLoader);
+                if (audioDialogJson != null)
+                    Console.WriteLine("  Loaded AudioDialog from base game successfully.");
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  Warning: failed to load AudioDialog table: {ex.Message}");
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  Warning: failed to load AudioDialog from base game: {ex.Message}");
+            }
         }
 
         if (audioDialogJson == null)
@@ -780,9 +781,12 @@ internal static class Program
                             }
                             else
                             {
-                                // 未映射的文件：跳过不导出
+                                // 未映射的文件：导出到 unmapped/<lang>/<id>.<ext>（不再丢弃）
                                 Interlocked.Increment(ref localUnmapped);
-                                return;
+                                string langDir = AudioMap.LanguageToLower(lang);
+                                string unmappedPath = Path.Combine(
+                                    parsed.OutPath!, "unmapped", langDir, $"{entry.Id}{outExt}");
+                                outPath = unmappedPath;
                             }
 
                             string? dir = Path.GetDirectoryName(outPath);
@@ -832,10 +836,41 @@ internal static class Program
         // 会因为 Lazy<> 不再重新初始化而失败。临时文件已经在 WriteWav/WriteMp3 的 finally 中清理。
     }
 
+    /// <summary>
+    /// 从 Table block 加载 AudioDialog 表的 JSON。找不到或 chunk 缺失时返回 null。
+    /// 热更模式下部分 chunk 文件可能缺失（增量数据），此处逐文件容错：跳过缺失的 chunk 继续扫描。
+    /// </summary>
+    private static string? LoadAudioDialog(VfsLoader loader)
+    {
+        BlockMainInfo tableInfo;
+        try { tableInfo = loader.LoadBlockInfo(BlockType.Table); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Warning: failed to load Table block: {ex.Message}");
+            return null;
+        }
+
+        foreach (var chunk in tableInfo.Chunks)
+        {
+            foreach (var file in chunk.Files)
+            {
+                byte[] data;
+                try { data = loader.ExtractFileToBytes(BlockType.Table, chunk, file); }
+                catch (FileNotFoundException) { continue; }  // 热更模式：chunk 缺失，跳过该文件
+                var (rootName, json) = SparkBuffer.Parse(data);
+                if (rootName == "AudioDialog")
+                    return json;
+            }
+        }
+        return null;
+    }
+
     private static List<(string Name, byte[] Data)> ExtractPckFiles(VfsLoader loader, BlockType bt)
     {
         var result = new List<(string, byte[])>();
-        var info = loader.LoadBlockInfo(bt);
+        BlockMainInfo info;
+        try { info = loader.LoadBlockInfo(bt); }
+        catch (DirectoryNotFoundException) { return result; }
 
         foreach (var chunk in info.Chunks)
         {
@@ -843,8 +878,16 @@ internal static class Program
             {
                 if (file.FileName.EndsWith(".pck", StringComparison.OrdinalIgnoreCase))
                 {
-                    byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
-                    result.Add((file.FileName, data));
+                    try
+                    {
+                        byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
+                        result.Add((file.FileName, data));
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        // 热更模式：chunk 缺失，跳过
+                        Console.WriteLine($"  Skip: chunk missing for {file.FileName}");
+                    }
                 }
             }
         }
@@ -985,7 +1028,11 @@ internal static class Program
             var ffOutTask = ff.StandardOutput.ReadToEndAsync();
 
             vgm.WaitForExit();
-            ff.WaitForExit();
+            if (!ff.WaitForExit(60_000))
+            {
+                try { ff.Kill(entireProcessTree: true); } catch { }
+                throw new InvalidOperationException("ffmpeg 超时 (>60s)，已终止");
+            }
             // ffmpeg/vgmstream 已退出后再等 copyTask；若 ffmpeg 提前失败导致 broken pipe,
             // copyTask 会抛 IOException, 这里安全吞掉以让真实 exitCode 错误透出
             try { copyTask.Wait(); } catch { }
@@ -1129,24 +1176,37 @@ internal static class Program
         }
 
         // 收集所有 USM 文件
+        int skippedChunks = 0;
         var usmFiles = new List<(string Name, byte[] Data, BlockType BT)>();
         foreach (var bt in blocks)
         {
             Console.WriteLine($"Scanning {bt}...");
-            var info = loader.LoadBlockInfo(bt);
+            BlockMainInfo info;
+            try { info = loader.LoadBlockInfo(bt); }
+            catch (DirectoryNotFoundException) { continue; }  // 该 block 目录不存在，跳过
+
             foreach (var chunk in info.Chunks)
             {
                 foreach (var file in chunk.Files)
                 {
                     if (file.FileName.EndsWith(".usm", StringComparison.OrdinalIgnoreCase))
                     {
-                        byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
+                        byte[] data;
+                        try { data = loader.ExtractFileToBytes(bt, chunk, file); }
+                        catch (FileNotFoundException)
+                        {
+                            // 热更模式：chunk 缺失（增量数据），跳过该文件
+                            skippedChunks++;
+                            continue;
+                        }
                         usmFiles.Add((file.FileName, data, bt));
                     }
                 }
             }
         }
 
+        if (skippedChunks > 0)
+            Console.WriteLine($"  (skipped {skippedChunks} USM files whose chunk is missing in this VFS)");
         Console.WriteLine($"Found {usmFiles.Count} USM files");
         if (usmFiles.Count == 0) return;
 
@@ -1232,6 +1292,7 @@ internal static class Program
             FileName = ffmpegPath,
             RedirectStandardError = true,
             RedirectStandardOutput = true,
+            RedirectStandardInput = true,   // 防止 ffmpeg 读终端 stdin 挂死
             UseShellExecute = false,
             CreateNoWindow = true,
         };
@@ -1249,12 +1310,19 @@ internal static class Program
         {
             psi.ArgumentList.Add("-c"); psi.ArgumentList.Add("copy");
         }
+        psi.ArgumentList.Add("-nostdin");  // 明确禁用交互式 stdin
         psi.ArgumentList.Add(outPath);
 
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("启动 ffmpeg 失败");
+        proc.StandardInput.Close();  // 立即关闭 stdin，防止 ffmpeg 等待终端输入
         var stderrTask = proc.StandardError.ReadToEndAsync();
         var stdoutTask = proc.StandardOutput.ReadToEndAsync();
-        proc.WaitForExit();
+        // 超时保护：防止 ffmpeg 在畸形输入上挂死（60 秒上限）
+        if (!proc.WaitForExit(60_000))
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            throw new InvalidOperationException("ffmpeg 超时 (>60s)，已终止");
+        }
         string stderr = stderrTask.GetAwaiter().GetResult();
         return proc.ExitCode == 0;
     }
@@ -2050,6 +2118,7 @@ internal static class Program
         long perBundleAllocTrapMb = 0;  // 单个 bundle 处理后 GC 分配增量 > 此 MB 就 copy 到 trap dir (0=禁用)
         string trapDir = "oom-trap-bundles";
         long perBundleAllocLimitMb = 512;  // 单个 bundle 线程分配硬上限 MB (默认 512，防 OOM)
+        bool skipMissing = false;          // 热更模式：chunk 缺失时跳过而非报错
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -2080,6 +2149,7 @@ internal static class Program
                 case "--trap-bundle-alloc-mb": perBundleAllocTrapMb = long.Parse(RequireValue(args, ref i, a)); break;
                 case "--trap-dir": trapDir = RequireValue(args, ref i, a); break;
                 case "--per-bundle-alloc-limit-mb": perBundleAllocLimitMb = long.Parse(RequireValue(args, ref i, a)); break;
+                case "--skip-missing": skipMissing = true; break;
                 default: throw new ArgumentException($"Unknown argument: {a}");
             }
         }
@@ -2349,10 +2419,19 @@ internal static class Program
                         if (killSwitch.IsCancellationRequested) break;
                         string baseName = Path.GetFileName(file.FileName);
                         string outBundle = Path.Combine(scratch, baseName);
-                        using (var fs = new FileStream(outBundle, FileMode.Create, FileAccess.Write,
-                            FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+                        try
                         {
-                            loader.ExtractFile(bt, chunk, file, fs);
+                            using (var fs = new FileStream(outBundle, FileMode.Create, FileAccess.Write,
+                                FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+                            {
+                                loader.ExtractFile(bt, chunk, file, fs);
+                            }
+                        }
+                        catch (FileNotFoundException) when (skipMissing)
+                        {
+                            // 热更模式：chunk 文件缺失，跳过此 bundle
+                            Interlocked.Increment(ref bundlesFailed);
+                            continue;
                         }
                         Interlocked.Increment(ref stage1Extracted);
                         Interlocked.Add(ref totalBytes, file.Length);
