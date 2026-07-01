@@ -550,7 +550,34 @@ internal static class Program
             {
                 try
                 {
-                    if (File.Exists(c))
+                    if (c == "vgmstream-cli")
+                    {
+                        // 裸名：File.Exists 只查 cwd，必须用 Process.Start 才能搜索 PATH
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = c,
+                            ArgumentList = { "-V" },
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                        };
+                        using var proc = Process.Start(psi);
+                        if (proc != null)
+                        {
+                            if (proc.WaitForExit(3000))
+                            {
+                                vgmstream = c;
+                                Console.WriteLine($"  Found vgmstream-cli: {c} (from PATH)");
+                                break;
+                            }
+                            else
+                            {
+                                try { proc.Kill(entireProcessTree: true); } catch { }
+                            }
+                        }
+                    }
+                    else if (File.Exists(c))
                     {
                         vgmstream = Path.GetFullPath(c);
                         Console.WriteLine($"  Found vgmstream-cli: {vgmstream}");
