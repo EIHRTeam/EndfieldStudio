@@ -76,7 +76,7 @@ WEM → vgmstream-cli → WAV          USM → C# demuxer → MPEG-2 + HCA
 ### Project Structure
 
 ```
-AnimeStudio/
+EndfieldStudio/
 ├── AnimeStudio.Endfield/              ← Outer VFS decryption library (ported from fluffy-dumper)
 │   ├── Keys.cs                        ChaCha20 / XXTEA / UnityHashSecret keys
 │   ├── BlockType.cs                   25 BlockType enum
@@ -126,7 +126,7 @@ cd fluffy-dumper
 # Windows: vgmstream-cli at fluffy-dumper\vgmstream\bin\windows\vgmstream-cli.exe
 ```
 
-Place the `fluffy-dumper/` directory next to the `AnimeStudio/` directory (auto-detected), or pass explicitly:
+Place the `fluffy-dumper/` directory next to the `EndfieldStudio/` directory (auto-detected), or pass explicitly:
 
 ```bash
 # Linux
@@ -155,10 +155,11 @@ sudo apt install vgmstream  # may be older version
 # Or: winget install vgmstream
 ```
 
+After installing, `vgmstream-cli` is auto-detected from PATH, so no `--vgmstream` flag is needed:
+
 ```bash
 endfield-dump audio --vfs ./StreamingAssets --out ./audio \
     --language chinese --format wav --threads 16
-# vgmstream-cli auto-detected from PATH
 ```
 
 **Option C: Skip audio decoding**
@@ -174,16 +175,16 @@ endfield-dump audio --vfs ./StreamingAssets --out ./audio \
 **Linux:**
 
 ```bash
-cd AnimeStudio
-dotnet build AnimeStudio.Endfield.Cli -c Release
+cd EndfieldStudio
+dotnet build AnimeStudio.Endfield.Cli/AnimeStudio.Endfield.Cli.csproj -c Release
 # Output: AnimeStudio.Endfield.Cli/bin/Release/net9.0/endfield-dump.dll
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-cd AnimeStudio
-dotnet build AnimeStudio.Endfield.Cli -c Release
+cd EndfieldStudio
+dotnet build AnimeStudio.Endfield.Cli\AnimeStudio.Endfield.Cli.csproj -c Release
 # Output: AnimeStudio.Endfield.Cli\bin\Release\net9.0\endfield-dump.dll
 ```
 
@@ -200,7 +201,7 @@ Or manually:
 ```bash
 cat > ~/.local/bin/endfield-dump << 'EOF'
 #!/usr/bin/env bash
-exec dotnet "/path/to/AnimeStudio/AnimeStudio.Endfield.Cli/bin/Release/net9.0/endfield-dump.dll" "$@"
+exec dotnet "/path/to/EndfieldStudio/AnimeStudio.Endfield.Cli/bin/Release/net9.0/endfield-dump.dll" "$@"
 EOF
 chmod +x ~/.local/bin/endfield-dump
 ```
@@ -211,14 +212,14 @@ chmod +x ~/.local/bin/endfield-dump
 # Create a wrapper batch file in a PATH directory
 @'
 @echo off
-dotnet "C:\path\to\AnimeStudio\AnimeStudio.Endfield.Cli\bin\Release\net9.0\endfield-dump.dll" %*
+dotnet "C:\path\to\EndfieldStudio\AnimeStudio.Endfield.Cli\bin\Release\net9.0\endfield-dump.dll" %*
 '@ | Set-Content "$env:ProgramFiles\endfield-dump\endfield-dump.cmd"
 ```
 
 Or add the DLL directory to PATH and run directly:
 
 ```powershell
-$env:PATH += ";C:\path\to\AnimeStudio\AnimeStudio.Endfield.Cli\bin\Release\net9.0"
+$env:PATH += ";C:\path\to\EndfieldStudio\AnimeStudio.Endfield.Cli\bin\Release\net9.0"
 dotnet endfield-dump.dll extract --vfs .\StreamingAssets --out .\out --exclude-material --classify --threads 16
 ```
 
