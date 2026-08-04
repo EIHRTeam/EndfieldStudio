@@ -197,12 +197,7 @@ internal static class Program
 
         foreach (var bt in blockEnumerable)
         {
-            BlockMainInfo info;
-            try
-            {
-                info = loader.LoadBlockInfo(bt);
-            }
-            catch (DirectoryNotFoundException)
+            if (!loader.TryLoadBlockInfo(bt, out BlockMainInfo? info))
             {
                 Console.WriteLine($"[{bt.Name()}] (not present, skipped)");
                 continue;
@@ -234,6 +229,9 @@ internal static class Program
         if (parsed.VfsPath is null) throw new ArgumentException("--vfs is required");
         if (parsed.OutPath is null) throw new ArgumentException("--out is required");
 
+        // 检查热更新 overlay 是否存在，不存在则提醒用户
+        WarnIfHotUpdateMissing(parsed.VfsPath);
+
         Directory.CreateDirectory(parsed.OutPath);
         var loader = new VfsLoader(parsed.VfsPath, Keys.ChaCha20Key);
         var blocks = parsed.Blocks.Count > 0 ? parsed.Blocks : (IEnumerable<BlockType>)BlockTypes.AllDumpable;
@@ -254,14 +252,9 @@ internal static class Program
     {
         Console.WriteLine($"Dumping {bt.Name()} files...");
 
-        BlockMainInfo info;
-        try
+        if (!loader.TryLoadBlockInfo(bt, out BlockMainInfo? info))
         {
-            info = loader.LoadBlockInfo(bt);
-        }
-        catch (DirectoryNotFoundException ex)
-        {
-            Console.WriteLine($"  Warning: {ex.Message}, skipping");
+            Console.WriteLine($"  Warning: {bt.Name()} is not present in this VFS layer, skipping");
             return;
         }
 
@@ -363,10 +356,11 @@ internal static class Program
         public int? Mp3Vbr;            // VBR 质量等级 0-9（数字越小越好，0≈245kbps, 4≈165kbps, 9≈65kbps）
         public int Threads;
         public Regex? AudioFilter;     // 映射路径正则过滤器（null = 不过滤）
+        public bool SkipUnmapped;      // 跳过无法由 AudioDialog 还原路径的条目
         public string? BaseVfsPath;    // 基础游戏 StreamingAssets（热更模式下用于回退加载 AudioDialog）
     }
 
-    private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice }
+    private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice, HotfixAudio }
 
     private static int RunAudio(ReadOnlySpan<string> args)
     {
@@ -441,6 +435,9 @@ internal static class Program
                     // 快捷方式：只提取干员语音
                     parsed.AudioFilter = new Regex(@"Characters/chr_\d+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
                     break;
+                case "--skip-unmapped":
+                    parsed.SkipUnmapped = true;
+                    break;
                 case "--base-vfs":
                     // 热更模式：基础游戏 StreamingAssets，用于回退加载 AudioDialog 表
                     parsed.BaseVfsPath = RequireValue(args, ref i, a);
@@ -476,6 +473,7 @@ internal static class Program
             "initialaudio" or "initaudio" => AudioBlockGroup.InitialAudio,
             "auditaudio" => AudioBlockGroup.AuditAudio,
             "voice" => AudioBlockGroup.Voice,
+            "hotfixaudio" or "hotfix" => AudioBlockGroup.HotfixAudio,
             _ => throw new ArgumentException($"Unknown audio block group: {blockStr}"),
         };
 
@@ -495,7 +493,7 @@ internal static class Program
             blocks.Add(BlockType.InitialAudio);
         if (group is AudioBlockGroup.All or AudioBlockGroup.AuditAudio)
             blocks.Add(BlockType.AuditAudio);
-        if (group is AudioBlockGroup.All or AudioBlockGroup.Voice)
+        if (group is AudioBlockGroup.All or AudioBlockGroup.Voice or AudioBlockGroup.HotfixAudio)
         {
             foreach (var lang in languages)
             {
@@ -509,11 +507,66 @@ internal static class Program
                 });
             }
         }
+        if (group is AudioBlockGroup.All or AudioBlockGroup.HotfixAudio)
+            blocks.Add(BlockType.HotfixAudio);
         return blocks;
+    }
+
+    /// <summary>
+    /// 检查游戏目录旁边是否存在 HotUpdate overlay。
+    /// v1.4.4+ 的语言语音 PCK 在热更新层，缺失会导致 audio 提取只有共享音频（SFX/Music），
+    /// 缺少所有干员语音和剧情对话音频。
+    /// </summary>
+    private static void WarnIfHotUpdateMissing(string vfsPath)
+    {
+        try
+        {
+            string vfsAbs = Path.GetFullPath(vfsPath);
+            string? vfsParent = Path.GetDirectoryName(vfsAbs.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            string? gameRoot = vfsParent != null ? Path.GetDirectoryName(vfsParent) : null;
+            if (gameRoot == null) return;
+
+            string hotupdatePath = Path.Combine(gameRoot + "_HotUpdate", "Endfield_Data", "StreamingAssets");
+            if (!Directory.Exists(hotupdatePath))
+            {
+                // 检查是否有一些已知的语音 block 目录（验证用户是否确实缺少语音）
+                Console.WriteLine();
+                Console.WriteLine("⚠️  HotUpdate overlay not detected!");
+                Console.WriteLine($"   Expected at: {hotupdatePath}");
+                Console.WriteLine("   Language voice PCKs (AudioChinese/English/Japanese/Korean) are distributed");
+                Console.WriteLine("   via hot-update. Without it, audio extraction will only get shared SFX/Music,");
+                Console.WriteLine("   missing ALL operator voices and story dialog audio.");
+                Console.WriteLine("   Run the EIHR game downloader to fetch hot-update data first:");
+                Console.WriteLine($"     eihr hotupdate --path \"{gameRoot}\"");
+                Console.WriteLine();
+            }
+        }
+        catch { /* 路径推导失败时静默跳过 */ }
     }
 
     private static void RunAudioPipeline(AudioArgs parsed)
     {
+        // 自动检测热更新 overlay：如果用户只指定了基础 VFS 但旁边有 HotUpdate 目录，自动切换。
+        // v1.4.4+ 的语言语音 PCK 在热更新层，不在基础安装包中。
+        if (string.IsNullOrEmpty(parsed.BaseVfsPath) && !string.IsNullOrEmpty(parsed.VfsPath))
+        {
+            string vfsAbs = Path.GetFullPath(parsed.VfsPath);
+            string? vfsParent = Path.GetDirectoryName(vfsAbs.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            string? gameRoot = vfsParent != null ? Path.GetDirectoryName(vfsParent) : null;
+            if (gameRoot != null)
+            {
+                string hotupdatePath = Path.Combine(gameRoot + "_HotUpdate", "Endfield_Data", "StreamingAssets");
+                if (Directory.Exists(hotupdatePath) && !Path.GetFullPath(hotupdatePath).Equals(vfsAbs, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"[audio] Auto-detected HotUpdate overlay: {hotupdatePath}");
+                    Console.WriteLine("[audio] Language voice PCKs (AudioChinese/English/Japanese/Korean) require the hot-update layer.");
+                    Console.WriteLine($"[audio] Switching primary VFS to HotUpdate, using base game as fallback.");
+                    parsed.BaseVfsPath = parsed.VfsPath;
+                    parsed.VfsPath = hotupdatePath;
+                }
+            }
+        }
+
         var loader = new VfsLoader(parsed.VfsPath!, Keys.ChaCha20Key);
         // 当前生效的输出格式（探测失败会降级到 wem）
         string outFmt = parsed.Format;  // wem | wav | mp3
@@ -550,7 +603,34 @@ internal static class Program
             {
                 try
                 {
-                    if (File.Exists(c))
+                    if (c == "vgmstream-cli")
+                    {
+                        // 裸名：File.Exists 只查 cwd，必须用 Process.Start 才能搜索 PATH
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = c,
+                            ArgumentList = { "-V" },
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                        };
+                        using var proc = Process.Start(psi);
+                        if (proc != null)
+                        {
+                            if (proc.WaitForExit(3000))
+                            {
+                                vgmstream = c;
+                                Console.WriteLine($"  Found vgmstream-cli: {c} (from PATH)");
+                                break;
+                            }
+                            else
+                            {
+                                try { proc.Kill(entireProcessTree: true); } catch { }
+                            }
+                        }
+                    }
+                    else if (File.Exists(c))
                     {
                         vgmstream = Path.GetFullPath(c);
                         Console.WriteLine($"  Found vgmstream-cli: {vgmstream}");
@@ -677,157 +757,165 @@ internal static class Program
         int totalErrors = 0;
         int totalUnmapped = 0;
 
-        foreach (var lang in parsed.Languages)
+        // 构建多语言 hash map：一次为所有语言生成 FNV-1a 64 hash → path 映射。
+        // 这样同一次 PCK 遍历就能匹配所有语言的 WEM 条目。
+        Console.WriteLine("\nBuilding multi-language audio hash map...");
+        var audioMap = audioDialogJson != null
+            ? AudioMap.FromAudioDialogMultiLanguage(audioDialogJson, parsed.Languages)
+            : new AudioMap();
+
+        if (audioMap.Count > 0)
+            Console.WriteLine($"  Found {audioMap.Count} audio entries ({parsed.Languages.Count} languages)");
+
+        foreach (var bt in parsed.Blocks)
         {
-            Console.WriteLine($"\nProcessing {AudioMap.LanguageName(lang)} audio...");
+            Console.WriteLine($"  Extracting from {bt.Name()}...");
 
-            var audioMap = audioDialogJson != null
-                ? AudioMap.FromAudioDialog(audioDialogJson, lang)
-                : new AudioMap();
-
-            if (audioMap.Count > 0)
-                Console.WriteLine($"  Found {audioMap.Count} audio entries");
-
-            foreach (var bt in parsed.Blocks)
+            List<(string Name, byte[] Data)> pckFiles;
+            try
             {
-                Console.WriteLine($"  Extracting {AudioMap.LanguageName(lang)} from {bt.Name()}...");
+                pckFiles = ExtractPckFiles(loader, bt);
+            }
+            catch (DirectoryNotFoundException)
+            {
+                Console.WriteLine($"    Skip: no PCK files found in {bt.Name()}");
+                continue;
+            }
 
-                List<(string Name, byte[] Data)> pckFiles;
+            if (pckFiles.Count == 0)
+            {
+                Console.WriteLine($"    Skip: no PCK files found");
+                continue;
+            }
+
+            Console.WriteLine($"    Found {pckFiles.Count} PCK files");
+
+            var opts = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = parsed.Threads > 0 ? parsed.Threads : Environment.ProcessorCount,
+            };
+
+            int success = 0;
+            int errors = 0;
+            int unmapped = 0;
+            int skipped = 0;
+            Regex? audioFilter = parsed.AudioFilter;
+
+            // 单遍处理：解析每个 PCK 并提取 WEM
+            Parallel.ForEach(pckFiles, opts, pckFile =>
+            {
+                var (pckName, pckData) = pckFile;
+                AkpkPackage package;
                 try
                 {
-                    pckFiles = ExtractPckFiles(loader, bt);
+                    package = AkpkPackage.Parse(pckData);
                 }
-                catch (DirectoryNotFoundException)
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"    Skip: no PCK files found in {bt.Name()}");
-                    continue;
-                }
-
-                if (pckFiles.Count == 0)
-                {
-                    Console.WriteLine($"    Skip: no PCK files found");
-                    continue;
+                    Console.Error.WriteLine($"      Error: failed to parse {pckName}: {ex.Message}");
+                    Interlocked.Increment(ref errors);
+                    return;
                 }
 
-                Console.WriteLine($"    Found {pckFiles.Count} PCK files");
+                int localSuccess = 0;
+                int localErrors = 0;
+                int localUnmapped = 0;
+                int localSkipped = 0;
 
-                var opts = new ParallelOptions
+                Parallel.ForEach(package.Entries, opts, entry =>
                 {
-                    MaxDegreeOfParallelism = parsed.Threads > 0 ? parsed.Threads : Environment.ProcessorCount,
-                };
-
-                int success = 0;
-                int errors = 0;
-                int unmapped = 0;
-                int skipped = 0;
-                Regex? audioFilter = parsed.AudioFilter;
-
-                foreach (var (pckName, pckData) in pckFiles)
-                {
-                    Console.WriteLine($"    Processing {pckName}");
-
-                    AkpkPackage package;
                     try
                     {
-                        package = AkpkPackage.Parse(pckData);
+                        byte[] wemData = package.GetWemData(entry);
+                        if (wemData.Length < 4)
+                        {
+                            Interlocked.Increment(ref localErrors);
+                            return;
+                        }
+
+                        // 校验 RIFF/RIFX 头
+                        if (wemData[0] != (byte)'R' || wemData[1] != (byte)'I' ||
+                            wemData[2] != (byte)'F' ||
+                            (wemData[3] != (byte)'F' && wemData[3] != (byte)'X'))
+                        {
+                            Interlocked.Increment(ref localErrors);
+                            return;
+                        }
+
+                        string hash = $"{entry.Id:x}";
+                        string outPath;
+                        string outExt = "." + outFmt;  // .wem | .wav | .mp3
+
+                        // 用 FNV-1a 64 hash 匹配（多语言 hash map 已包含所有语言的路径）
+                        string? mappedPath = audioMap.GetPath(hash);
+
+                        if (mappedPath is string mp)
+                        {
+                            // 正则过滤：如果不匹配则跳过
+                            if (audioFilter != null && !audioFilter.IsMatch(mp))
+                            {
+                                Interlocked.Increment(ref localSkipped);
+                                return;
+                            }
+                            string pathWithExt = Path.ChangeExtension(mp, outExt);
+                            outPath = Path.Combine(parsed.OutPath!, pathWithExt);
+                        }
+                        else
+                        {
+                            // 启用路径过滤时，未映射条目不可能证明属于目标集合。
+                            // 直接跳过，避免 --operator-only / 档案语音精确导出时
+                            // 把整个 PCK 的 unmapped 音频写入输出目录。
+                            if (audioFilter != null || parsed.SkipUnmapped)
+                            {
+                                Interlocked.Increment(ref localSkipped);
+                                return;
+                            }
+
+                            // 未映射的文件：导出到 unmapped/<id>.<ext>
+                            Interlocked.Increment(ref localUnmapped);
+                            string unmappedPath = Path.Combine(
+                                parsed.OutPath!, "unmapped", $"{entry.Id}{outExt}");
+                            outPath = unmappedPath;
+                        }
+
+                        string? dir = Path.GetDirectoryName(outPath);
+                        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                        if (outFmt == "mp3" && vgmstream != null && ffmpeg != null)
+                        {
+                            WriteMp3ViaPipe(wemData, outPath, vgmstream, ffmpeg, parsed.Mp3Bitrate, parsed.Mp3Vbr);
+                        }
+                        else if (outFmt == "wav" && vgmstream != null)
+                        {
+                            WriteWavViaVgmstream(wemData, outPath, vgmstream);
+                        }
+                        else
+                        {
+                            File.WriteAllBytes(outPath, wemData);
+                        }
+
+                        Interlocked.Increment(ref localSuccess);
                     }
                     catch (Exception ex)
                     {
-                        Console.Error.WriteLine($"      Error: failed to parse {pckName}: {ex.Message}");
-                        errors++;
-                        continue;
+                        Interlocked.Increment(ref localErrors);
+                        Console.Error.WriteLine($"      Error: failed to write {entry.Id}: {ex.Message}");
                     }
+                });
 
-                    var entries = package.Entries;
-                    int localSuccess = 0;
-                    int localErrors = 0;
-                    int localUnmapped = 0;
-                    int localSkipped = 0;
+                Interlocked.Add(ref success, localSuccess);
+                Interlocked.Add(ref errors, localErrors);
+                Interlocked.Add(ref unmapped, localUnmapped);
+                Interlocked.Add(ref skipped, localSkipped);
+            });
 
-                    Parallel.ForEach(entries, opts, entry =>
-                    {
-                        try
-                        {
-                            byte[] wemData = package.GetWemData(entry);
-                            if (wemData.Length < 4)
-                            {
-                                Interlocked.Increment(ref localErrors);
-                                return;
-                            }
-
-                            // 校验 RIFF/RIFX 头
-                            if (wemData[0] != (byte)'R' || wemData[1] != (byte)'I' ||
-                                wemData[2] != (byte)'F' ||
-                                (wemData[3] != (byte)'F' && wemData[3] != (byte)'X'))
-                            {
-                                Interlocked.Increment(ref localErrors);
-                                return;
-                            }
-
-                            string hash = $"{entry.Id:x}";
-                            string outPath;
-                            string outExt = "." + outFmt;  // .wem | .wav | .mp3
-
-                            if (audioMap.GetPath(hash) is string mappedPath)
-                            {
-                                // 正则过滤：如果不匹配则跳过
-                                if (audioFilter != null && !audioFilter.IsMatch(mappedPath))
-                                {
-                                    Interlocked.Increment(ref localSkipped);
-                                    return;
-                                }
-                                string pathWithExt = Path.ChangeExtension(mappedPath, outExt);
-                                outPath = Path.Combine(parsed.OutPath!, pathWithExt);
-                            }
-                            else
-                            {
-                                // 未映射的文件：导出到 unmapped/<lang>/<id>.<ext>（不再丢弃）
-                                Interlocked.Increment(ref localUnmapped);
-                                string langDir = AudioMap.LanguageToLower(lang);
-                                string unmappedPath = Path.Combine(
-                                    parsed.OutPath!, "unmapped", langDir, $"{entry.Id}{outExt}");
-                                outPath = unmappedPath;
-                            }
-
-                            string? dir = Path.GetDirectoryName(outPath);
-                            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
-                            if (outFmt == "mp3" && vgmstream != null && ffmpeg != null)
-                            {
-                                WriteMp3ViaPipe(wemData, outPath, vgmstream, ffmpeg, parsed.Mp3Bitrate, parsed.Mp3Vbr);
-                            }
-                            else if (outFmt == "wav" && vgmstream != null)
-                            {
-                                WriteWavViaVgmstream(wemData, outPath, vgmstream);
-                            }
-                            else
-                            {
-                                File.WriteAllBytes(outPath, wemData);
-                            }
-
-                            Interlocked.Increment(ref localSuccess);
-                        }
-                        catch (Exception ex)
-                        {
-                            Interlocked.Increment(ref localErrors);
-                            Console.Error.WriteLine($"      Error: failed to write {entry.Id}: {ex.Message}");
-                        }
-                    });
-
-                    success += localSuccess;
-                    errors += localErrors;
-                    unmapped += localUnmapped;
-                    skipped += localSkipped;
-                }
-
-                if (audioFilter != null)
-                    Console.WriteLine($"    Done: processed {success} entries ({skipped} filtered, {unmapped} unmapped, {errors} errors)");
-                else
-                    Console.WriteLine($"    Done: processed {success} entries ({unmapped} unmapped, {errors} errors)");
-                Interlocked.Add(ref totalSuccess, success);
-                Interlocked.Add(ref totalErrors, errors);
-                Interlocked.Add(ref totalUnmapped, unmapped);
-            }
+            if (audioFilter != null)
+                Console.WriteLine($"    Done: processed {success} entries ({skipped} filtered, {unmapped} unmapped, {errors} errors)");
+            else
+                Console.WriteLine($"    Done: processed {success} entries ({unmapped} unmapped, {errors} errors)");
+            Interlocked.Add(ref totalSuccess, success);
+            Interlocked.Add(ref totalErrors, errors);
+            Interlocked.Add(ref totalUnmapped, unmapped);
         }
 
         Console.WriteLine($"\nComplete: extracted {totalSuccess} files ({totalUnmapped} unmapped, {totalErrors} errors)");
@@ -868,9 +956,7 @@ internal static class Program
     private static List<(string Name, byte[] Data)> ExtractPckFiles(VfsLoader loader, BlockType bt)
     {
         var result = new List<(string, byte[])>();
-        BlockMainInfo info;
-        try { info = loader.LoadBlockInfo(bt); }
-        catch (DirectoryNotFoundException) { return result; }
+        if (!loader.TryLoadBlockInfo(bt, out BlockMainInfo? info)) return result;
 
         foreach (var chunk in info.Chunks)
         {
@@ -1181,9 +1267,7 @@ internal static class Program
         foreach (var bt in blocks)
         {
             Console.WriteLine($"Scanning {bt}...");
-            BlockMainInfo info;
-            try { info = loader.LoadBlockInfo(bt); }
-            catch (DirectoryNotFoundException) { continue; }  // 该 block 目录不存在，跳过
+            if (!loader.TryLoadBlockInfo(bt, out BlockMainInfo? info)) continue;
 
             foreach (var chunk in info.Chunks)
             {
@@ -1366,9 +1450,7 @@ internal static class Program
         var allFiles = new List<(BlockType bt, ChunkInfo chunk, AnimeStudio.Endfield.FileInfo file)>();
         foreach (var bt in new[] { BlockType.Bundle })
         {
-            BlockMainInfo info;
-            try { info = loader.LoadBlockInfo(bt); }
-            catch (DirectoryNotFoundException) { continue; }
+            if (!loader.TryLoadBlockInfo(bt, out BlockMainInfo? info)) continue;
             foreach (var chunk in info.Chunks)
                 foreach (var file in chunk.Files)
                 {
@@ -1555,9 +1637,7 @@ internal static class Program
         var allFiles = new List<(BlockType bt, ChunkInfo chunk, AnimeStudio.Endfield.FileInfo file)>();
         foreach (var bt in new[] { BlockType.Bundle })
         {
-            BlockMainInfo info;
-            try { info = loader.LoadBlockInfo(bt); }
-            catch (DirectoryNotFoundException) { continue; }
+            if (!loader.TryLoadBlockInfo(bt, out BlockMainInfo? info)) continue;
             foreach (var chunk in info.Chunks)
                 foreach (var file in chunk.Files)
                 {
@@ -2215,9 +2295,7 @@ internal static class Program
         var batches = new List<List<(BlockType bt, ChunkInfo chunk, AnimeStudio.Endfield.FileInfo file)>>();
         foreach (var bt in blocks)
         {
-            BlockMainInfo info;
-            try { info = loader.LoadBlockInfo(bt); }
-            catch (DirectoryNotFoundException) { continue; }
+            if (!loader.TryLoadBlockInfo(bt, out BlockMainInfo? info)) continue;
 
             foreach (var chunk in info.Chunks)
             {
@@ -2405,49 +2483,59 @@ internal static class Program
             {
                 FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = false,
-                SingleWriter = true,
+                SingleWriter = false,  // 多线程 producer
             };
             var bundleChannel = Channel.CreateBounded<(string path, long size)>(channelOpts);
 
-            // Producer: 串行解 bundle 到 scratch
-            var producer = Task.Run(async () =>
+            // Producer: 多线程并行解 bundle 到 scratch
+            int producerThreads = Math.Min(effectiveThreads, Math.Max(2, effectiveThreads / 2));
+            var batchItems = batch.ToArray();
+            int bundleSeq = 0;  // 原子序号，保证 scratch 文件名唯一
+            var producers = new Task[producerThreads];
+            for (int pt = 0; pt < producerThreads; pt++)
             {
-                try
+                producers[pt] = Task.Run(async () =>
                 {
-                    foreach (var (bt, chunk, file) in batch)
+                    try
                     {
-                        if (killSwitch.IsCancellationRequested) break;
-                        string baseName = Path.GetFileName(file.FileName);
-                        string outBundle = Path.Combine(scratch, baseName);
-                        try
+                        // 多 producer 分片：用 Interlocked.Increment 轮流领取 batch 项
+                        int idx;
+                        while ((idx = Interlocked.Increment(ref bundleSeq) - 1) < batchItems.Length)
                         {
-                            using (var fs = new FileStream(outBundle, FileMode.Create, FileAccess.Write,
-                                FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+                            if (killSwitch.IsCancellationRequested) break;
+                            var (bt, chunk, file) = batchItems[idx];
+                            int seq = idx;
+                            string outBundle = Path.Combine(scratch, $"b_{seq}_{Path.GetFileName(file.FileName)}");
+                            try
                             {
-                                loader.ExtractFile(bt, chunk, file, fs);
+                                using (var fs = new FileStream(outBundle, FileMode.Create, FileAccess.Write,
+                                    FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+                                {
+                                    loader.ExtractFile(bt, chunk, file, fs);
+                                }
                             }
+                            catch (FileNotFoundException) when (skipMissing)
+                            {
+                                Interlocked.Increment(ref bundlesFailed);
+                                continue;
+                            }
+                            Interlocked.Increment(ref stage1Extracted);
+                            Interlocked.Add(ref totalBytes, file.Length);
+                            try
+                            {
+                                await bundleChannel.Writer.WriteAsync((outBundle, file.Length), killSwitch.Token);
+                                Interlocked.Increment(ref currentChannelBacklog);
+                            }
+                            catch (OperationCanceledException) { break; }
                         }
-                        catch (FileNotFoundException) when (skipMissing)
-                        {
-                            // 热更模式：chunk 文件缺失，跳过此 bundle
-                            Interlocked.Increment(ref bundlesFailed);
-                            continue;
-                        }
-                        Interlocked.Increment(ref stage1Extracted);
-                        Interlocked.Add(ref totalBytes, file.Length);
-                        try
-                        {
-                            await bundleChannel.Writer.WriteAsync((outBundle, file.Length), killSwitch.Token);
-                            Interlocked.Increment(ref currentChannelBacklog);
-                        }
-                        catch (OperationCanceledException) { break; }
                     }
-                }
-                finally
-                {
-                    bundleChannel.Writer.Complete();
-                }
-            });
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"  Producer error: {ex.Message}");
+                    }
+                });
+            }
+            var producer = Task.WhenAll(producers).ContinueWith(_ => bundleChannel.Writer.Complete());
 
             // Consumers: parallel LoadFiles + decode
             var consumers = new Task[effectiveThreads];

@@ -29,6 +29,16 @@ public sealed class AkpkPackage
     public List<WemEntry> Entries { get; } = new();
     public Dictionary<uint, string> Languages { get; } = new();
 
+    /// <summary>
+    /// 存储所有 BNK 的数据范围（start, end），供 HIRC 解析使用。
+    /// </summary>
+    public List<(int Start, int End)> BnkRanges { get; } = new();
+
+    /// <summary>
+    /// 原始 PCK 数据（供 HIRC 解析器访问 BNK 原始字节）。
+    /// </summary>
+    public byte[] RawData => _data;
+
     private readonly byte[] _data;
 
     private AkpkPackage(byte[] data)
@@ -187,9 +197,15 @@ public sealed class AkpkPackage
 
             if (!isSounds)
             {
-                // banks 段：解析 BNK 内的 DIDX/Data 子段，提取 WEM
+                // banks 段：BNK 数据被加密，先解密再解析 DIDX/Data + HIRC
                 int bnkStart = (int)offset;
                 int bnkEnd = bnkStart + (int)size;
+                int bnkLen = bnkEnd - bnkStart;
+
+                // 原地解密 BNK 数据（用 file_id 作为 seed，dataOffset=0）
+                AkpkCrypto.DecryptVfs(_data, bnkStart, bnkLen, (uint)fileIdLow, 0);
+
+                BnkRanges.Add((bnkStart, bnkEnd));
                 foreach (var (wemId, wemOffset, wemSize) in ParseBnk(bnkStart, bnkEnd))
                 {
                     Entries.Add(new WemEntry
