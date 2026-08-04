@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics.CodeAnalysis;
 
 namespace AnimeStudio.Endfield;
 
@@ -55,6 +56,33 @@ public sealed class VfsLoader
         cipher.ApplyKeystream(decrypted);
 
         return VfsParser.Parse(decrypted, verifyCrc: true);
+    }
+
+    /// <summary>
+    /// Loads a block index when that block is available in the current VFS layer.
+    /// Optional blocks may be represented by neither a directory nor a .blc file
+    /// (and some game versions leave an empty directory behind). Both forms mean
+    /// "not present"; malformed or unreadable block indexes still throw.
+    /// </summary>
+    public bool TryLoadBlockInfo(
+        BlockType bt,
+        [NotNullWhen(true)] out BlockMainInfo? info)
+    {
+        try
+        {
+            info = LoadBlockInfo(bt);
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            info = null;
+            return false;
+        }
+        catch (FileNotFoundException)
+        {
+            info = null;
+            return false;
+        }
     }
 
     public long ExtractFile(BlockType bt, ChunkInfo chunk, FileInfo file, Stream writer)
