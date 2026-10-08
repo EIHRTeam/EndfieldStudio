@@ -17,6 +17,7 @@ public sealed class AkpkPackage
     private static readonly byte[] DataMagic = { (byte)'D', (byte)'A', (byte)'T', (byte)'A' };
     private static readonly byte[] RiffMagic = { (byte)'R', (byte)'I', (byte)'F', (byte)'F' };
     private static readonly byte[] RifxMagic = { (byte)'R', (byte)'I', (byte)'F', (byte)'X' };
+    private static readonly byte[] PlugMagic = { (byte)'P', (byte)'L', (byte)'U', (byte)'G' };
 
     public sealed class WemEntry
     {
@@ -211,7 +212,9 @@ public sealed class AkpkPackage
                     Entries.Add(new WemEntry
                     {
                         Id = wemId,
-                        Offset = offset + wemOffset,
+                        // ParseBnk returns an absolute offset in the PCK buffer.
+                        // Adding this bank's start a second time corrupts embedded WEMs.
+                        Offset = wemOffset,
                         Size = wemSize,
                         Language = language,
                     });
@@ -235,7 +238,7 @@ public sealed class AkpkPackage
 
     /// <summary>
     /// 解析 BNK 的 DIDX 段，返回 (wemId, wemDataOffset, wemSize) 三元组列表。
-    /// wemDataOffset 已加上 DATA 段头偏移。
+    /// wemDataOffset 是包含 DATA 段头的 PCK 缓冲区绝对偏移。
     /// </summary>
     private List<(uint Id, uint Offset, uint Size)> ParseBnk(int start, int end)
     {
@@ -288,13 +291,19 @@ public sealed class AkpkPackage
 
         if (data.Length >= 4 &&
             !BytesEqual(data, 0, RiffMagic, 0, 4) &&
-            !BytesEqual(data, 0, RifxMagic, 0, 4))
+            !BytesEqual(data, 0, RifxMagic, 0, 4) &&
+            !BytesEqual(data, 0, PlugMagic, 0, 4))
         {
             AkpkCrypto.DecryptWem(data, (uint)entry.Id);
         }
 
         return data;
     }
+
+    /// <summary>Wwise plugin media is a length-prefixed PLUG container, not a RIFF WEM.</summary>
+    public static bool IsPluginData(byte[] data) =>
+        data.Length >= 8 && BytesEqual(data, 0, PlugMagic, 0, 4) &&
+        ReadU32LE(data, 4) == (uint)(data.Length - 8);
 
     private static uint ReadU32LE(byte[] data, int offset)
     {

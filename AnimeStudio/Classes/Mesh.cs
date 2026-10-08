@@ -536,6 +536,30 @@ namespace AnimeStudio
         private CompressedMesh m_CompressedMesh;
         private StreamingInfo m_StreamData;
         private bool m_CollisionMeshBaked = false;
+        private bool m_SerializedPayloadFullyRead;
+        public bool IsBakedCollisionMesh => m_CollisionMeshBaked;
+        public int BakedConvexCollisionBytes { get; private set; }
+        public int BakedTriangleCollisionBytes { get; private set; }
+        // Some collision-only imports retain historical submesh extents after
+        // both render and baked collision payloads have been stripped. Require
+        // a fully consumed record and absence of every actual geometry buffer;
+        // the baked flag alone must never hide an unsupported decoder layout.
+        public bool IsStrippedBakedCollisionMesh => m_SerializedPayloadFullyRead && m_CollisionMeshBaked &&
+            BakedConvexCollisionBytes == 0 && BakedTriangleCollisionBytes == 0 &&
+            m_VertexCount == 0 && (m_Vertices == null || m_Vertices.Length == 0) &&
+            m_Indices.Count == 0 && m_IndexBuffer != null && m_IndexBuffer.Length == 0 &&
+            m_CompressedMesh == null && m_VertexData != null && m_VertexData.m_VertexCount == 0 &&
+            m_VertexData.m_DataSize != null && m_VertexData.m_DataSize.Length == 0 &&
+            m_VertexData.m_Channels != null && m_VertexData.m_Channels.All(channel => channel.dimension == 0) &&
+            m_StreamData != null && m_StreamData.offset == 0 && m_StreamData.size == 0 && string.IsNullOrEmpty(m_StreamData.path);
+        public bool HasNoPrimitives => m_Indices.Count == 0 &&
+            (m_IndexBuffer == null || m_IndexBuffer.Length == 0) &&
+            (m_SubMeshes == null || m_SubMeshes.All(submesh => submesh.indexCount == 0));
+        public bool IsEmptyGeometry => m_VertexCount == 0 &&
+            (m_Vertices == null || m_Vertices.Length == 0) &&
+            HasNoPrimitives &&
+            (m_StreamData == null || m_StreamData.size == 0) &&
+            (m_CompressedMesh == null || m_CompressedMesh.m_Vertices.m_NumItems == 0);
 
         public static bool HasVertexColorSkinning(SerializedType type) => type.Match("413A501B79022BF2DF389A82002FC81F");
 
@@ -777,8 +801,10 @@ namespace AnimeStudio
             if (version[0] >= 5) //5.0 and up
             {
                 var m_BakedConvexCollisionMesh = reader.ReadUInt8Array();
+                BakedConvexCollisionBytes = m_BakedConvexCollisionMesh.Length;
                 reader.AlignStream();
                 var m_BakedTriangleCollisionMesh = reader.ReadUInt8Array();
+                BakedTriangleCollisionBytes = m_BakedTriangleCollisionMesh.Length;
                 reader.AlignStream();
                 if (reader.Game.Type.IsBH3())
                 {
@@ -854,6 +880,7 @@ namespace AnimeStudio
                 var m_BonesPerVertex = reader.ReadUInt32();
             }
 
+            m_SerializedPayloadFullyRead = reader.Position - reader.byteStart == reader.byteSize;
             ProcessData();
         }
 
@@ -863,8 +890,13 @@ namespace AnimeStudio
             {
                 if (m_VertexData.m_VertexCount > 0)
                 {
+                    long budget = assetsFile.assetsManager.PerFileAllocBudgetBytes;
+                    if (budget > 0 && m_StreamData.size > budget)
+                        throw new AllocBudgetExceededException(m_StreamData.size, budget, assetsFile.fileName);
                     var resourceReader = new ResourceReader(m_StreamData.path, assetsFile, m_StreamData.offset, m_StreamData.size);
                     m_VertexData.m_DataSize = resourceReader.GetData();
+                    if (budget > 0 && m_VertexData.m_DataSize.LongLength != m_StreamData.size)
+                        throw new EndOfStreamException("Mesh resource stream is truncated");
                 }
             }
             if (version[0] > 3 || (version[0] == 3 && version[1] >= 5)) //3.5 and up
@@ -888,6 +920,11 @@ namespace AnimeStudio
 
         private void ReadVertexData()
         {
+            long budget = assetsFile.assetsManager.PerFileAllocBudgetBytes;
+            // New bounded exporters instantiate Mesh directly, without ReadAssets.
+            // Reject corrupt vertex counts before allocating per-channel buffers.
+            if (budget > 0 && (long)m_VertexData.m_VertexCount * 256 > budget)
+                throw new AllocBudgetExceededException((long)m_VertexData.m_VertexCount * 256, budget, assetsFile.fileName);
             m_VertexCount = (int)m_VertexData.m_VertexCount;
 
             for (var chn = 0; chn < m_VertexData.m_Channels.Count; chn++)
@@ -906,6 +943,14 @@ namespace AnimeStudio
 
                         var vertexFormat = MeshHelper.ToVertexFormat(m_Channel.format, version);
                         var componentByteSize = (int)MeshHelper.GetFormatSize(vertexFormat);
+                        if (budget > 0 && m_VertexCount > 0)
+                        {
+                            long lastByte = (long)m_Stream.offset + m_Channel.offset +
+                                (long)m_Stream.stride * (m_VertexCount - 1) +
+                                (long)m_Channel.dimension * componentByteSize;
+                            if (lastByte > m_VertexData.m_DataSize.LongLength)
+                                throw new EndOfStreamException("Mesh vertex channel exceeds available resource data");
+                        }
                         var componentBytes = new byte[m_VertexCount * m_Channel.dimension * componentByteSize];
                         for (int v = 0; v < m_VertexCount; v++)
                         {

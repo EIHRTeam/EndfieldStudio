@@ -12,31 +12,40 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
 
 namespace AnimeStudio.Endfield.Cli;
 
-internal static class Program
+internal static partial class Program
 {
     private const string Usage =
         """
         Usage:
           endfield-dump dump    --vfs <streaming_assets_path> --out <dir> [--block <type>...] [--threads N]
-          endfield-dump list    --vfs <streaming_assets_path> [--block <type>...]
-          endfield-dump inspect --vfs <streaming_assets_path> [--limit N] [--min-size N] [--names <regex>]
+          endfield-dump list    --vfs <streaming_assets_path> [--block <type>...] [--list-files | --json]
+          endfield-dump inspect --vfs <streaming_assets_path> [--limit N] [--skip N] [--min-size N] [--names <regex>] [--manifest <json>]
           endfield-dump extract --vfs <streaming_assets_path> --out <dir>
                                 [--bundle-name <regex>] [--asset-name <regex>] [--types <T>...]
                                 [--block <type>...] [--threads N] [--scratch <dir>] [--keep-bundles]
                                 [--format png|bmp|tga] [--png-compression none|fast|default]
                                 [--max-memory-gb N] [--no-chunk-batching]
                                 [--exclude-material] [--classify]
+          endfield-dump original --vfs <streaming_assets_path> --out <dir> [--threads N]
+                                [--block <type>...] [--bundle-name <regex>] [--limit N]
+                                [--source <Block/source_path>...]
+                                [--max-memory-gb N] [--scratch <dir>]
+                                [--raw] [--metadata] [--resources] [--full]
+                                (default: lean — decoded png/obj/bytes + Material/Mesh .json
+                                 sidecars; undecoded objects are index-only with source offsets)
           endfield-dump audio   --vfs <streaming_assets_path> --out <dir>
                                 [--language all|chinese|english|japanese|korean]
-                                [--format wem|wav|mp3] [--block all|audio|initialaudio|auditaudio|voice]
+                                [--format wem|wav|mp3] [--block all|audio|initialaudio|auditaudio|voice|hotfixaudio|nonvoice]
                                 [--vgmstream <path>] [--ffmpeg <path>]
                                 [--mp3-bitrate 192] [--mp3-quality best|high|medium|low|minimum|0-9]
                                 [--threads N] [--base-vfs <base_streaming_assets>]
+                                [--skip-unmapped] [--audio-filter <regex> | --operator-only]
           endfield-dump video   --vfs <streaming_assets_path> --out <dir>
                                 [--format mp4|usm] [--block all|video|auditvideo]
                                 [--ffmpeg <path>] [--threads N]
@@ -46,6 +55,12 @@ internal static class Program
           AuditStreaming, AuditDynamicStreaming, AuditIV, AuditAudio, AuditVideo,
           Bundle, Audio, Video, IV, Streaming, DynamicStreaming, Lua, Table, JsonData,
           ExtendData, HotfixAudio, AudioChinese, AudioEnglish, AudioJapanese, AudioKorean
+
+        `list --json` reads only block indexes and emits stable file/chunk metadata.
+        Every selected block must exist; version numbers and encrypted headers are omitted.
+
+        `audio --skip-unmapped` exports only paths resolved by AudioDialog,
+        skipping unnamed numeric-ID audio and Wwise plugin containers before decoding.
 
         `inspect` decrypts up to N (default=1) bundles into /dev/shm/efend, loads them
         with AnimeStudio (Stage 2 + 3), and lists Texture2D names matching --names regex.
@@ -74,6 +89,7 @@ internal static class Program
                 "list" => RunList(args.AsSpan(1)),
                 "inspect" => RunInspect(args.AsSpan(1)),
                 "extract" => await RunExtract(args[1..]),
+                "original" => RunOriginal(args[1..]),
                 "audio" => RunAudio(args.AsSpan(1)),
                 "video" => RunVideo(args.AsSpan(1)),
                 "inspect-bundle" => RunInspectBundle(args.AsSpan(1)),
@@ -170,6 +186,7 @@ internal static class Program
         string? vfsPath = null;
         var blocks = new List<BlockType>();
         bool listFiles = false;
+        bool json = false;
         for (int i = 0; i < args.Length; i++)
         {
             string a = args[i];
@@ -186,6 +203,9 @@ internal static class Program
                 case "--list-files":
                     listFiles = true;
                     break;
+                case "--json":
+                    json = true;
+                    break;
                 default:
                     throw new ArgumentException($"Unknown argument: {a}");
             }
@@ -194,6 +214,56 @@ internal static class Program
 
         var loader = new VfsLoader(vfsPath, Keys.ChaCha20Key);
         var blockEnumerable = blocks.Count > 0 ? blocks : (IEnumerable<BlockType>)BlockTypes.AllDumpable;
+
+        if (json)
+        {
+            if (listFiles)
+                throw new ArgumentException("--json and --list-files cannot be combined");
+            // Materialize every selected BLC before writing anything. Missing or
+            // malformed indexes must fail instead of yielding a partial cache key.
+            var outputBlocks = blockEnumerable.Distinct().OrderBy(bt => (int)bt).Select(bt =>
+            {
+                BlockMainInfo info = loader.LoadBlockInfo(bt);
+                return new
+                {
+                    type = (int)bt,
+                    name = bt.Name(),
+                    chunks = info.Chunks.Select(chunk => new
+                    {
+                        name = chunk.FileName(),
+                        content_md5 = chunk.ContentMd5.ToString("x32", CultureInfo.InvariantCulture),
+                        length = chunk.Length,
+                        files = chunk.Files.OrderBy(file => file.FileName, StringComparer.Ordinal)
+                            .ThenBy(file => file.FileNameHash)
+                            .ThenBy(file => file.FileDataMd5)
+                            .ThenBy(file => file.FileChunkMd5)
+                            .ThenBy(file => file.Offset)
+                            .ThenBy(file => file.Length)
+                            .ThenBy(file => file.UseEncrypt)
+                            .ThenBy(file => file.IvSeed)
+                            .ThenBy(file => (int)file.FileTag)
+                            .Select(file => new
+                            {
+                                name = file.FileName,
+                                file_name_hash = file.FileNameHash,
+                                file_data_md5 = file.FileDataMd5.ToString("x32", CultureInfo.InvariantCulture),
+                                file_chunk_md5 = file.FileChunkMd5.ToString("x32", CultureInfo.InvariantCulture),
+                                offset = file.Offset,
+                                length = file.Length,
+                                use_encrypt = file.UseEncrypt,
+                                iv_seed = file.IvSeed,
+                                file_tag = (int)file.FileTag,
+                            }).ToArray(),
+                    }).OrderBy(chunk => chunk.name, StringComparer.Ordinal)
+                      .ThenBy(chunk => chunk.content_md5, StringComparer.Ordinal)
+                      .ThenBy(chunk => chunk.length)
+                      .ThenBy(chunk => JsonSerializer.Serialize(chunk.files), StringComparer.Ordinal)
+                      .ToArray(),
+                };
+            }).ToArray();
+            Console.WriteLine(JsonSerializer.Serialize(new { schema = 1, blocks = outputBlocks }));
+            return 0;
+        }
 
         foreach (var bt in blockEnumerable)
         {
@@ -281,7 +351,7 @@ internal static class Program
                         string? dir = Path.GetDirectoryName(outPath);
                         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                         byte[] data = loader.ExtractFileToBytes(bt, chunk, file);
-                        byte[] processed = LuaProcessor.DecryptAndNormalize(data);
+                        byte[] processed = LuaProcessor.ProcessVfsFile(file.FileName, data);
                         File.WriteAllBytes(outPath, processed);
                     }
                     else if (bt == BlockType.Table)
@@ -343,7 +413,7 @@ internal static class Program
 
     // ── audio 子命令 ──────────────────────────────────────────────
 
-    private sealed class AudioArgs
+    internal sealed class AudioArgs
     {
         public string? VfsPath;
         public string? OutPath;
@@ -360,7 +430,7 @@ internal static class Program
         public string? BaseVfsPath;    // 基础游戏 StreamingAssets（热更模式下用于回退加载 AudioDialog）
     }
 
-    private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice, HotfixAudio }
+    private enum AudioBlockGroup { All, Audio, InitialAudio, AuditAudio, Voice, HotfixAudio, NonVoice }
 
     private static int RunAudio(ReadOnlySpan<string> args)
     {
@@ -474,6 +544,7 @@ internal static class Program
             "auditaudio" => AudioBlockGroup.AuditAudio,
             "voice" => AudioBlockGroup.Voice,
             "hotfixaudio" or "hotfix" => AudioBlockGroup.HotfixAudio,
+            "nonvoice" => AudioBlockGroup.NonVoice,
             _ => throw new ArgumentException($"Unknown audio block group: {blockStr}"),
         };
 
@@ -487,11 +558,11 @@ internal static class Program
     private static List<BlockType> ResolveAudioBlocks(AudioBlockGroup group, List<AudioMap.Language> languages)
     {
         var blocks = new List<BlockType>();
-        if (group is AudioBlockGroup.All or AudioBlockGroup.Audio)
+        if (group is AudioBlockGroup.All or AudioBlockGroup.Audio or AudioBlockGroup.NonVoice)
             blocks.Add(BlockType.Audio);
-        if (group is AudioBlockGroup.All or AudioBlockGroup.InitialAudio)
+        if (group is AudioBlockGroup.All or AudioBlockGroup.InitialAudio or AudioBlockGroup.NonVoice)
             blocks.Add(BlockType.InitialAudio);
-        if (group is AudioBlockGroup.All or AudioBlockGroup.AuditAudio)
+        if (group is AudioBlockGroup.All or AudioBlockGroup.AuditAudio or AudioBlockGroup.NonVoice)
             blocks.Add(BlockType.AuditAudio);
         if (group is AudioBlockGroup.All or AudioBlockGroup.Voice or AudioBlockGroup.HotfixAudio)
         {
@@ -507,7 +578,7 @@ internal static class Program
                 });
             }
         }
-        if (group is AudioBlockGroup.All or AudioBlockGroup.HotfixAudio)
+        if (group is AudioBlockGroup.All or AudioBlockGroup.HotfixAudio or AudioBlockGroup.NonVoice)
             blocks.Add(BlockType.HotfixAudio);
         return blocks;
     }
@@ -756,6 +827,8 @@ internal static class Program
         int totalSuccess = 0;
         int totalErrors = 0;
         int totalUnmapped = 0;
+        int totalPlugins = 0;
+        int totalSkipped = 0;
 
         // 构建多语言 hash map：一次为所有语言生成 FNV-1a 64 hash → path 映射。
         // 这样同一次 PCK 遍历就能匹配所有语言的 WEM 条目。
@@ -799,6 +872,7 @@ internal static class Program
             int errors = 0;
             int unmapped = 0;
             int skipped = 0;
+            int plugins = 0;
             Regex? audioFilter = parsed.AudioFilter;
 
             // 单遍处理：解析每个 PCK 并提取 WEM
@@ -817,108 +891,34 @@ internal static class Program
                     return;
                 }
 
-                int localSuccess = 0;
-                int localErrors = 0;
-                int localUnmapped = 0;
-                int localSkipped = 0;
-
-                Parallel.ForEach(package.Entries, opts, entry =>
-                {
-                    try
-                    {
-                        byte[] wemData = package.GetWemData(entry);
-                        if (wemData.Length < 4)
-                        {
-                            Interlocked.Increment(ref localErrors);
-                            return;
-                        }
-
-                        // 校验 RIFF/RIFX 头
-                        if (wemData[0] != (byte)'R' || wemData[1] != (byte)'I' ||
-                            wemData[2] != (byte)'F' ||
-                            (wemData[3] != (byte)'F' && wemData[3] != (byte)'X'))
-                        {
-                            Interlocked.Increment(ref localErrors);
-                            return;
-                        }
-
-                        string hash = $"{entry.Id:x}";
-                        string outPath;
-                        string outExt = "." + outFmt;  // .wem | .wav | .mp3
-
-                        // 用 FNV-1a 64 hash 匹配（多语言 hash map 已包含所有语言的路径）
-                        string? mappedPath = audioMap.GetPath(hash);
-
-                        if (mappedPath is string mp)
-                        {
-                            // 正则过滤：如果不匹配则跳过
-                            if (audioFilter != null && !audioFilter.IsMatch(mp))
-                            {
-                                Interlocked.Increment(ref localSkipped);
-                                return;
-                            }
-                            string pathWithExt = Path.ChangeExtension(mp, outExt);
-                            outPath = Path.Combine(parsed.OutPath!, pathWithExt);
-                        }
-                        else
-                        {
-                            // 启用路径过滤时，未映射条目不可能证明属于目标集合。
-                            // 直接跳过，避免 --operator-only / 档案语音精确导出时
-                            // 把整个 PCK 的 unmapped 音频写入输出目录。
-                            if (audioFilter != null || parsed.SkipUnmapped)
-                            {
-                                Interlocked.Increment(ref localSkipped);
-                                return;
-                            }
-
-                            // 未映射的文件：导出到 unmapped/<id>.<ext>
-                            Interlocked.Increment(ref localUnmapped);
-                            string unmappedPath = Path.Combine(
-                                parsed.OutPath!, "unmapped", $"{entry.Id}{outExt}");
-                            outPath = unmappedPath;
-                        }
-
-                        string? dir = Path.GetDirectoryName(outPath);
-                        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
-                        if (outFmt == "mp3" && vgmstream != null && ffmpeg != null)
-                        {
-                            WriteMp3ViaPipe(wemData, outPath, vgmstream, ffmpeg, parsed.Mp3Bitrate, parsed.Mp3Vbr);
-                        }
-                        else if (outFmt == "wav" && vgmstream != null)
-                        {
-                            WriteWavViaVgmstream(wemData, outPath, vgmstream);
-                        }
-                        else
-                        {
-                            File.WriteAllBytes(outPath, wemData);
-                        }
-
-                        Interlocked.Increment(ref localSuccess);
-                    }
-                    catch (Exception ex)
-                    {
-                        Interlocked.Increment(ref localErrors);
-                        Console.Error.WriteLine($"      Error: failed to write {entry.Id}: {ex.Message}");
-                    }
-                });
-
-                Interlocked.Add(ref success, localSuccess);
-                Interlocked.Add(ref errors, localErrors);
-                Interlocked.Add(ref unmapped, localUnmapped);
-                Interlocked.Add(ref skipped, localSkipped);
+                var result = ExtractAudioPackage(package, audioMap, parsed, pckName, bt, outFmt, vgmstream, ffmpeg);
+                Interlocked.Add(ref success, result.Success);
+                Interlocked.Add(ref errors, result.Errors);
+                Interlocked.Add(ref unmapped, result.Unmapped);
+                Interlocked.Add(ref skipped, result.Skipped);
+                Interlocked.Add(ref plugins, result.Plugins);
             });
 
-            if (audioFilter != null)
+            if (audioFilter != null || parsed.SkipUnmapped)
                 Console.WriteLine($"    Done: processed {success} entries ({skipped} filtered, {unmapped} unmapped, {errors} errors)");
             else
                 Console.WriteLine($"    Done: processed {success} entries ({unmapped} unmapped, {errors} errors)");
             Interlocked.Add(ref totalSuccess, success);
             Interlocked.Add(ref totalErrors, errors);
             Interlocked.Add(ref totalUnmapped, unmapped);
+            Interlocked.Add(ref totalPlugins, plugins);
+            Interlocked.Add(ref totalSkipped, skipped);
+            if (plugins > 0)
+                Console.WriteLine($"    Preserved {plugins} plugin media containers (.plug, original bytes)");
         }
 
         Console.WriteLine($"\nComplete: extracted {totalSuccess} files ({totalUnmapped} unmapped, {totalErrors} errors)");
+
+        if (parsed.SkipUnmapped || parsed.AudioFilter != null)
+            Console.WriteLine($"Audio entries skipped by path policy: {totalSkipped}");
+
+        if (totalPlugins > 0)
+            Console.WriteLine($"Plugin media preserved: {totalPlugins} files (not converted to audio)");
 
         // 注意：不删除 WavScratchDir 目录本身，否则同一进程内后续调用 RunAudioPipeline
         // 会因为 Lazy<> 不再重新初始化而失败。临时文件已经在 WriteWav/WriteMp3 的 finally 中清理。
@@ -2047,8 +2047,10 @@ internal static class Program
     {
         string? vfsPath = null;
         int limit = 1;
+        int skip = 0;
         long minSize = 0;
         string? namesRegex = null;
+        string? manifestPath = null;
         var types = new List<string>();
         var blocks = new List<BlockType>();
 
@@ -2059,8 +2061,10 @@ internal static class Program
             {
                 case "--vfs": vfsPath = RequireValue(args, ref i, a); break;
                 case "--limit": limit = int.Parse(RequireValue(args, ref i, a)); break;
+                case "--skip": skip = int.Parse(RequireValue(args, ref i, a)); break;
                 case "--min-size": minSize = long.Parse(RequireValue(args, ref i, a)); break;
                 case "--names": namesRegex = RequireValue(args, ref i, a); break;
+                case "--manifest": manifestPath = RequireValue(args, ref i, a); break;
                 case "--types": types.Add(RequireValue(args, ref i, a)); break;
                 case "--block": blocks.Add(ParseBlockType(RequireValue(args, ref i, a))); break;
                 default: throw new ArgumentException($"Unknown argument: {a}");
@@ -2095,7 +2099,7 @@ internal static class Program
         candidates.Sort((a, b) => b.file.Length.CompareTo(a.file.Length));
 
         var extracted = new List<string>();
-        foreach (var (bt, chunk, file) in candidates)
+        foreach (var (bt, chunk, file) in candidates.Skip(skip))
         {
             if (extracted.Count >= limit) break;
             string outPath = Path.Combine(scratch, Path.GetFileName(file.FileName));
@@ -2126,6 +2130,7 @@ internal static class Program
         int total = 0, t2d = 0, matched = 0;
         var matchedNames = new List<(string name, int width, int height, AS.TextureFormat fmt)>();
         var typeHisto = new Dictionary<string, int>();
+        var manifest = new List<string>();
 
         foreach (var sf in mgr.assetsFileList)
         {
@@ -2134,6 +2139,31 @@ internal static class Program
                 total++;
                 string typeName = obj.GetType().Name;
                 typeHisto[typeName] = typeHisto.GetValueOrDefault(typeName) + 1;
+                string objectName = obj is AS.NamedObject named ? (named.m_Name ?? "") : "";
+                if (rx is not null && obj is AS.NamedObject && rx.IsMatch(objectName))
+                {
+                    manifest.Add($"{{\"file\":{System.Text.Json.JsonSerializer.Serialize(sf.fileName)},\"type\":{System.Text.Json.JsonSerializer.Serialize(typeName)},\"name\":{System.Text.Json.JsonSerializer.Serialize(objectName)}}}");
+                }
+                if (rx is not null && obj is AS.AssetBundle bundle)
+                {
+                    foreach (var entry in bundle.m_Container)
+                    {
+                        if (!rx.IsMatch(entry.Key)) continue;
+                        manifest.Add($"{{\"file\":{System.Text.Json.JsonSerializer.Serialize(sf.fileName)},\"type\":\"AssetBundleContainer\",\"name\":{System.Text.Json.JsonSerializer.Serialize(entry.Key)},\"pathId\":{entry.Value.asset.m_PathID}}}");
+                    }
+                }
+                if (rx is not null && obj is AS.Material material && rx.IsMatch(material.m_Name ?? ""))
+                {
+                    string shaderName = material.m_Shader.TryGet(out var shader) ? (shader.m_Name ?? "") : "";
+                    manifest.Add($"{{\"file\":{System.Text.Json.JsonSerializer.Serialize(sf.fileName)},\"type\":\"MaterialShader\",\"material\":{System.Text.Json.JsonSerializer.Serialize(material.m_Name)},\"shader\":{System.Text.Json.JsonSerializer.Serialize(shaderName)}}}");
+                    foreach (var texEnv in material.m_SavedProperties.m_TexEnvs)
+                    {
+                        string textureName = texEnv.Value.m_Texture.TryGet(out var texture) ? (texture.m_Name ?? "") : "";
+                        int fileId = texEnv.Value.m_Texture.m_FileID;
+                        string externalFile = fileId > 0 && fileId <= sf.m_Externals.Count ? sf.m_Externals[fileId - 1].fileName : "";
+                        manifest.Add($"{{\"file\":{System.Text.Json.JsonSerializer.Serialize(sf.fileName)},\"type\":\"MaterialTexture\",\"material\":{System.Text.Json.JsonSerializer.Serialize(material.m_Name)},\"slot\":{System.Text.Json.JsonSerializer.Serialize(texEnv.Key)},\"texture\":{System.Text.Json.JsonSerializer.Serialize(textureName)},\"fileId\":{fileId},\"externalFile\":{System.Text.Json.JsonSerializer.Serialize(externalFile)},\"pathId\":{texEnv.Value.m_Texture.m_PathID}}}");
+                    }
+                }
                 if (obj is AS.Texture2D tex)
                 {
                     t2d++;
@@ -2163,6 +2193,14 @@ internal static class Program
             Console.WriteLine("First 30 matched Texture2D:");
             foreach (var (name, w, h, fmt) in matchedNames.Take(30))
                 Console.WriteLine($"  {name,-50} {w}x{h} {fmt}");
+        }
+
+        if (manifestPath is not null)
+        {
+            string fullManifestPath = Path.GetFullPath(manifestPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullManifestPath)!);
+            File.WriteAllText(fullManifestPath, "[\n" + string.Join(",\n", manifest) + "\n]\n");
+            Console.WriteLine($"  Manifest       = {fullManifestPath} ({manifest.Count} matching named objects)");
         }
 
         return 0;
@@ -2339,7 +2377,7 @@ internal static class Program
             + $"| max-memory = {maxMemoryGb} GB  | chunk-batching = {!noChunkBatching}");
 
         // ── Global counters (persist across batches) ──
-        long pngWritten = 0, bundlesProcessed = 0, bundlesFailed = 0;
+        long pngWritten = 0, bundlesProcessed = 0, bundlesFailed = 0, bundlesSkippedMissing = 0;
         long objectsScanned = 0, texturesMatched = 0, texturesDecodeFailed = 0;
         long materialSkipped = 0;
         long totalBytes = 0;
@@ -2516,7 +2554,7 @@ internal static class Program
                             }
                             catch (FileNotFoundException) when (skipMissing)
                             {
-                                Interlocked.Increment(ref bundlesFailed);
+                                Interlocked.Increment(ref bundlesSkippedMissing);
                                 continue;
                             }
                             Interlocked.Increment(ref stage1Extracted);
@@ -2606,6 +2644,7 @@ internal static class Program
                                     }
                                         string name = tex.m_Name ?? "";
                                         if (assetRx != null && !assetRx.IsMatch(name)) continue;
+
 
                                         // 排除材质贴图（T_ 前缀的 PBR 槽位贴图）
                                         if (excludeMaterial && IsMaterialTexture(name))
@@ -2789,6 +2828,8 @@ internal static class Program
         swTotal.Stop();
         Console.WriteLine(
             $"  bundles processed       = {bundlesProcessed:#,0} ({bundlesFailed:#,0} failed)");
+        Console.WriteLine(
+            $"  bundles skipped (missing) = {bundlesSkippedMissing:#,0}");
         Console.WriteLine(
             $"  objects scanned         = {objectsScanned:#,0}");
         Console.WriteLine(

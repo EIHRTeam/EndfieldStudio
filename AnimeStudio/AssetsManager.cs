@@ -15,6 +15,9 @@ namespace AnimeStudio
         public Game Game;
         public bool Silent = false;
         public bool SkipProcess = false;
+        // Export jobs may require a complete bundle and must not silently keep
+        // malformed serialized files as opaque resource streams.
+        public bool ThrowOnLoadError = false;
         public bool ResolveDependencies = false;
         public string SpecifyUnityVersion;
         /// <summary>
@@ -28,6 +31,8 @@ namespace AnimeStudio
 
         internal Dictionary<string, int> assetsFileIndexCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         internal Dictionary<string, BinaryReader> resourceFileReaders = new Dictionary<string, BinaryReader>(StringComparer.OrdinalIgnoreCase);
+        // Embedded streams remain owned by this manager and are disposed by Clear().
+        public IReadOnlyDictionary<string, BinaryReader> ResourceFileReaders => resourceFileReaders;
 
         internal List<string> importFiles = new List<string>();
         internal HashSet<string> importFilesHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -213,6 +218,7 @@ namespace AnimeStudio
                     LoadAssetsFile(reader);
                     break;
                 case FileType.BundleFile:
+                case FileType.VFSFile:
                     LoadGameBlockFile(reader);
                     break;
                 case FileType.WebFile:
@@ -287,6 +293,7 @@ namespace AnimeStudio
                 {
                     Logger.Error($"Error while reading assets file {reader.FullPath}", e);
                     reader.Dispose();
+                    if (ThrowOnLoadError) throw;
                 }
             }
             else
@@ -333,6 +340,7 @@ namespace AnimeStudio
                 }
                 catch (Exception e)
                 {
+                    if (ThrowOnLoadError) throw;
                     Logger.Error($"Error while reading assets file {reader.FullPath} from {Path.GetFileName(originalPath)}", e);
                     resourceFileReaders.TryAdd(reader.FileName, reader);
                 }
@@ -528,6 +536,7 @@ namespace AnimeStudio
             }
             catch (Exception e)
             {
+                if (ThrowOnLoadError) throw;
                 Logger.Error($"Error while reading block file {reader.FileName}", e);
             }
             finally
@@ -563,7 +572,7 @@ namespace AnimeStudio
                         file = new HygFile(reader, reader.FullPath);
                         break;
                     case FileType.VFSFile:
-                        file = new VFSFile(reader, reader.FullPath, Game.Type);
+                        file = new VFSFile(reader, reader.FullPath, Game.Type, PerFileAllocBudgetBytes);
                         break;
                 }
 
@@ -619,6 +628,7 @@ namespace AnimeStudio
             }
             catch (InvalidCastException)
             {
+                if (ThrowOnLoadError) throw;
                 string name = "";
                 switch (reader.FileType)
                 {
@@ -643,6 +653,7 @@ namespace AnimeStudio
             }
             catch (Exception e)
             {
+                if (ThrowOnLoadError) throw;
                 var str = $"Error while reading file {reader.FullPath}";
                 if (originalPath != null)
                 {

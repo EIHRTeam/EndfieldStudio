@@ -8,6 +8,13 @@ namespace AnimeStudio.Endfield.Processors;
 /// </summary>
 public static class LuaProcessor
 {
+    public static bool IsLuaSource(string sourcePath) =>
+        Path.GetExtension(sourcePath).Equals(".lua", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Lua blocks can also contain ordinary files, such as Markdown documentation.</summary>
+    public static byte[] ProcessVfsFile(string sourcePath, byte[] raw) =>
+        IsLuaSource(sourcePath) ? DecryptAndNormalize(raw) : raw ?? throw new ArgumentNullException(nameof(raw));
+
     /// <summary>
     /// Takes raw extracted bytes (a base64 ASCII text payload), base64-decodes,
     /// xxtea-decrypts, then normalizes newlines.

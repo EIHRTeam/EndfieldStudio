@@ -22,6 +22,15 @@ namespace AnimeStudio
         public List<PPtr<Material>> m_Materials;
         public StaticBatchInfo m_StaticBatchInfo;
         public uint[] m_SubsetIndices;
+        public bool m_Enabled;
+        public byte m_CharacterIndex;
+        public int m_RendererPriority;
+        public uint m_SortingLayerID;
+        public short m_SortingLayer;
+        public short m_SortingOrder;
+        public bool m_EnableCharacterOutline;
+        public bool m_EnablePerRendererLighting;
+        public float m_RendererSortingFudge;
         private bool isNewHeader = false;
 
         public static bool HasPrope(SerializedType type) => type.Match("F622BC5EE0E86D7BDF8C912DD94DCBF5") || type.Match("9255FA54269ADD294011FDA525B5FCAC");
@@ -32,7 +41,7 @@ namespace AnimeStudio
         {
             if (version[0] < 5) //5.0 down
             {
-                var m_Enabled = reader.ReadBoolean();
+                m_Enabled = reader.ReadBoolean();
                 var m_CastShadows = reader.ReadBoolean();
                 var m_ReceiveShadows = reader.ReadBoolean();
                 var m_LightmapIndex = reader.ReadByte();
@@ -49,7 +58,7 @@ namespace AnimeStudio
                     {
                         CheckHeader(reader, 0x12);
                     }
-                    var m_Enabled = reader.ReadBoolean();
+                    m_Enabled = reader.ReadBoolean();
                     var m_CastShadows = reader.ReadByte();
                     var m_ReceiveShadows = reader.ReadByte();
                     if (version[0] > 2017 || (version[0] == 2017 && version[1] >= 2)) //2017.2 and up
@@ -104,7 +113,7 @@ namespace AnimeStudio
                         {
                             var m_RealtimeShadowCaster = reader.ReadByte();
                             var m_SubMeshRenderMode = reader.ReadByte();
-                            var m_CharacterIndex = reader.ReadByte();
+                            m_CharacterIndex = reader.ReadByte();
                         }
                     }
                     var m_MotionVectors = reader.ReadByte();
@@ -134,7 +143,7 @@ namespace AnimeStudio
                 }
                 else
                 {
-                    var m_Enabled = reader.ReadBoolean();
+                    m_Enabled = reader.ReadBoolean();
                     reader.AlignStream();
                     var m_CastShadows = reader.ReadByte();
                     var m_ReceiveShadows = reader.ReadBoolean();
@@ -153,7 +162,7 @@ namespace AnimeStudio
 
                 if (version[0] > 2018 || (version[0] == 2018 && version[1] >= 3)) //2018.3 and up
                 {
-                    var m_RendererPriority = reader.ReadInt32();
+                    m_RendererPriority = reader.ReadInt32();
                 }
 
                 var m_LightmapIndex = reader.ReadUInt16();
@@ -243,16 +252,16 @@ namespace AnimeStudio
             {
                 if (version[0] == 4 && version[1] == 3) //4.3
                 {
-                    var m_SortingLayer = reader.ReadInt16();
+                    m_SortingLayer = reader.ReadInt16();
                 }
                 else
                 {
-                    var m_SortingLayerID = reader.ReadUInt32();
+                    m_SortingLayerID = reader.ReadUInt32();
                 }
 
                 //SInt16 m_SortingLayer 5.6 and up
-                var m_SortingLayer2 = reader.ReadInt16();
-                var m_SortingOrder = reader.ReadInt16();
+                m_SortingLayer = reader.ReadInt16();
+                m_SortingOrder = reader.ReadInt16();
                 reader.AlignStream();
                 if (reader.Game.Type.IsGIGroup() || reader.Game.Type.IsBH3())
                 {
@@ -281,13 +290,13 @@ namespace AnimeStudio
                 }
                 if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
                 {
-                    var m_EnableCharacterOutline = reader.ReadBoolean();
-                    var m_EnablePerRendererLighting = reader.ReadBoolean();
+                    m_EnableCharacterOutline = reader.ReadBoolean();
+                    m_EnablePerRendererLighting = reader.ReadBoolean();
                     reader.AlignStream();
                     var m_PerRendererLightingOffset = reader.ReadVector3();
                     var m_PerRendererLightingAnchor = new PPtr<Transform>(reader);
                     var m_LightModeMask = reader.ReadUInt32();
-                    var m_RendererSortingFudge = reader.ReadSingle();
+                    m_RendererSortingFudge = reader.ReadSingle();
                     reader.AlignStream();
                 }
             }

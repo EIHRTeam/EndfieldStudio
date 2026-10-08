@@ -16,9 +16,11 @@ namespace AnimeStudio
         public BundleFile.Header m_Header;
         public List<StreamFile> fileList;
         public long Offset;
+        private readonly long allocationBudget;
 
-        public VFSFile(FileReader reader, string path, GameType game)
+        public VFSFile(FileReader reader, string path, GameType game, long allocationBudgetBytes = 0)
         {
+            allocationBudget = allocationBudgetBytes > 0 ? allocationBudgetBytes : 512L * 1024 * 1024;
             Offset = reader.Position;
             reader.Endian = EndianType.BigEndian;
 
@@ -44,6 +46,7 @@ namespace AnimeStudio
                     $"compressedBlocksInfoSize={m_Header.compressedBlocksInfoSize:N0} " +
                     $"(file size={reader.BaseStream.Length:N0}). Likely VFS key/constant mismatch.");
             }
+            CheckAllocation(3L * m_Header.uncompressedBlocksInfoSize + m_Header.compressedBlocksInfoSize, path);
 
             // go to blocks info
             uint blockInfosOffset;
@@ -58,6 +61,8 @@ namespace AnimeStudio
                     blockInfosOffset = 40;
             }
 
+            if ((long)blockInfosOffset + m_Header.compressedBlocksInfoSize > reader.BaseStream.Length - Offset)
+                throw new IOException("VFS block metadata is outside its declared file range");
             reader.Position = Offset + blockInfosOffset;
             ReadBlocksInfoAndDirectory(reader, game);
 
@@ -78,6 +83,12 @@ namespace AnimeStudio
 
             reader.Position = Offset + dataOffset;
 
+            // The scrambled declared size is not the physical extracted extent in
+            // every Endfield revision. The supplied VFS slice is the authoritative
+            // bound; only end-positioned block metadata uses the header offset.
+            long dataEnd = (m_Header.flags & ArchiveFlags.BlocksInfoAtTheEnd) != 0 ? blockInfosOffset : reader.BaseStream.Length - Offset;
+            ValidateLayout(dataOffset, dataEnd, path);
+
             //
             using var blocksStream = CreateBlocksStream(path);
             ReadBlocks(reader, blocksStream, game);
@@ -87,6 +98,8 @@ namespace AnimeStudio
         private void ReadBlocksInfoAndDirectory(FileReader reader, GameType game)
         {
             byte[] blocksInfoBytes = reader.ReadBytes((int)m_Header.compressedBlocksInfoSize);
+            if (blocksInfoBytes.Length != m_Header.compressedBlocksInfoSize)
+                throw new EndOfStreamException("Truncated VFS block metadata");
 
             MemoryStream blocksInfoUncompressedStream = new MemoryStream();
             if (((int)m_Header.flags & 0x3F) != 0)
@@ -124,10 +137,52 @@ namespace AnimeStudio
             // read
             using (var blocksInfoReader = new EndianBinaryReader(blocksInfoUncompressedStream))
             {
-                reader.Endian = EndianType.BigEndian;
+                blocksInfoReader.Endian = EndianType.BigEndian;
                 m_BlocksInfo = VFSUtils.ReadBlocksInfos(blocksInfoReader, game);
                 m_DirectoryInfo = VFSUtils.ReadDirectoryInfos(blocksInfoReader, game);
             }
+        }
+
+        private void CheckAllocation(long expectedBytes, string path)
+        {
+            if (expectedBytes > allocationBudget)
+                throw new AllocBudgetExceededException(expectedBytes, allocationBudget, path);
+        }
+
+        private void ValidateLayout(long dataStart, long dataEnd, string path)
+        {
+            if (dataStart < 0 || dataEnd < dataStart)
+                throw new IOException("VFS data range is invalid");
+            long compressed = 0, uncompressed = 0, largestBuffers = 0, nodes = 0;
+            foreach (var block in m_BlocksInfo)
+            {
+                if ((int)block.flags is not (0 or 5))
+                    throw new IOException($"Unsupported VFS block compression type {(int)block.flags}");
+                if ((int)block.flags == 0 && block.compressedSize != block.uncompressedSize)
+                    throw new IOException("Uncompressed VFS block sizes differ");
+                if (block.compressedSize > int.MaxValue || block.uncompressedSize > int.MaxValue)
+                    throw new IOException("VFS block exceeds supported buffer size");
+                compressed += block.compressedSize;
+                uncompressed += block.uncompressedSize;
+                // ArrayPool can round each requested buffer up to the next power of two.
+                largestBuffers = Math.Max(largestBuffers, 2L * (block.compressedSize + (long)block.uncompressedSize));
+            }
+            if (compressed > dataEnd - dataStart)
+                throw new IOException("VFS compressed blocks exceed the available data range");
+            if (uncompressed >= 2L * 1024 * 1024 * 1024)
+                throw new IOException("VFS decompressed blocks exceed the 2 GB limit");
+            foreach (var node in m_DirectoryInfo)
+            {
+                if (node.offset < 0 || node.size < 0 || node.offset > uncompressed || node.size > uncompressed - node.offset)
+                    throw new IOException($"VFS node is outside the decompressed data: {node.path}");
+                if (node.size > 512L * 1024 * 1024)
+                    throw new IOException($"VFS node exceeds the 512 MB limit: {node.path}");
+                nodes += node.size;
+            }
+            // Check before MemoryStream/ArrayPool allocations, including the copies retained
+            // for embedded files. Compression ratio is not a corruption test: valid highly
+            // repetitive shaders/prefabs routinely exceed the previous arbitrary 20x limit.
+            CheckAllocation(uncompressed + nodes + largestBuffers, path);
         }
 
         private Stream CreateBlocksStream(string path)
@@ -135,7 +190,7 @@ namespace AnimeStudio
             Stream blocksStream;
             long uncompressedSizeSum = m_BlocksInfo.Sum(x => (long)x.uncompressedSize);
             Logger.Verbose($"Total size of decompressed blocks: 0x{uncompressedSizeSum:X8}");
-            // Sanity: 总解压大小不应超过单个文件大小 × 50（极保守）或 2GB 硬上限
+            // Layout validation above checks compressed ranges and allocation budget first.
             const long MaxBlocksStreamSize = 2L * 1024 * 1024 * 1024;  // 2 GB
             if (uncompressedSizeSum >= MaxBlocksStreamSize)
                 throw new IOException($"VFS blocks stream too large: {uncompressedSizeSum:N0} bytes (max {MaxBlocksStreamSize:N0})");
@@ -147,15 +202,6 @@ namespace AnimeStudio
         {
             foreach (var blockInfo in m_BlocksInfo)
             {
-                // Sanity check: 单个 block 的 size 不应超过文件本身大小 × 合理膨胀比
-                long fileSize = reader.BaseStream.Length;
-                if (blockInfo.compressedSize > fileSize || blockInfo.uncompressedSize > fileSize * 20)
-                {
-                    throw new IOException(
-                        $"VFS block sanity check failed: compressedSize={blockInfo.compressedSize:N0} " +
-                        $"uncompressedSize={blockInfo.uncompressedSize:N0} (file size={fileSize:N0})");
-                }
-
                 var compressionType = (int)blockInfo.flags; // no mask
                 Logger.Verbose($"Block compression type {compressionType}");
 
@@ -164,6 +210,7 @@ namespace AnimeStudio
                     case 0:
                         var size = (int)blockInfo.uncompressedSize;
                         var buffer = reader.ReadBytes(size);
+                        if (buffer.Length != size) throw new EndOfStreamException("Truncated uncompressed VFS block");
                         blocksStream.Write(buffer);
                         break;
                     case 5:
@@ -178,7 +225,7 @@ namespace AnimeStudio
 
                         try
                         {
-                            reader.Read(compressedBytesSpan);
+                            reader.BaseStream.ReadExactly(compressedBytesSpan);
 
                             VFSUtils.DecryptBlock(compressedBytesSpan, game);
 
@@ -186,16 +233,16 @@ namespace AnimeStudio
                             var numWrite = LZ4Inv.Instance.Decompress(compressedBytesSpan, uncompressedBytesSpan);
                             if (numWrite != uncompressedSize)
                             {
-                                Logger.Warning($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
+                                throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {uncompressedSize} bytes");
                             }
+                            blocksStream.Write(uncompressedBytesSpan);
                         }
                         catch (Exception e)
                         {
-                            Logger.Error($"Lz4 decompression error : {e.Message}");
+                            throw new IOException($"VFS Lz4 decompression failed: {e.Message}", e);
                         }
                         finally
                         {
-                            blocksStream.Write(uncompressedBytesSpan);
                             ArrayPool<byte>.Shared.Return(compressedBytes, true);
                             ArrayPool<byte>.Shared.Return(uncompressedBytes, true);
                         }
@@ -216,7 +263,6 @@ namespace AnimeStudio
             {
                 var node = m_DirectoryInfo[i];
                 var file = new StreamFile();
-                fileList.Add(file);
                 file.path = node.path;
                 file.fileName = Path.GetFileName(node.path);
                 if (node.size >= int.MaxValue || node.size > 512 * 1024 * 1024)  // 512 MB per file
@@ -228,6 +274,7 @@ namespace AnimeStudio
                 blocksStream.Position = node.offset;
                 blocksStream.CopyTo(file.stream, node.size);
                 file.stream.Position = 0;
+                fileList.Add(file);
             }
         }
     }

@@ -1213,6 +1213,25 @@ namespace AnimeStudio
         }
     }
 
+    public class SubShaderBlob
+    {
+        public int m_ShaderLOD;
+        public byte[] m_CompressedBlob;
+        public uint[][] m_Offsets;
+        public uint[][] m_CompressedLengths;
+        public uint[][] m_DecompressedLengths;
+
+        public SubShaderBlob(ObjectReader reader)
+        {
+            m_ShaderLOD = reader.ReadInt32();
+            m_CompressedBlob = reader.ReadUInt8Array();
+            reader.AlignStream();
+            m_Offsets = reader.ReadUInt32ArrayArray();
+            m_CompressedLengths = reader.ReadUInt32ArrayArray();
+            m_DecompressedLengths = reader.ReadUInt32ArrayArray();
+        }
+    }
+
     public class Shader : NamedObject
     {
         public byte[] m_Script;
@@ -1224,6 +1243,10 @@ namespace AnimeStudio
         public bool m_UseExternalBlobs;
         public int[] m_SubShaderBinaryDataLODs;
         public List<PPtr<SubShaderBinaryData>> m_SubShaderBinaryData;
+        public bool m_EnableShaderLODStreaming;
+        public List<SubShaderBlob> subShaderBlobs;
+        public long m_ExternalBlobTailOffset;
+        public int m_ExternalBlobTailBytes;
         public ShaderCompilerPlatform[] platforms;
         public uint[][] offsets;
         public uint[][] compressedLengths;
@@ -1247,34 +1270,38 @@ namespace AnimeStudio
                     Logger.Error($"Cannot parse shader, no more bytes left for asset {reader.assetsFile.fileName} of {reader.assetsFile.originalPath} at path {reader.m_PathID}.");
                     return;
                 }
-                if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
+                try
                 {
-                    m_UseExternalBlobs = reader.ReadBoolean();
-                    reader.AlignStream();
-                    m_SubShaderBinaryDataLODs = reader.ReadInt32Array();
-                    reader.AlignStream();
-
-                    int numSubShaderBinaryData = reader.ReadInt32Clamped(1_000_000);
-                    m_SubShaderBinaryData = new List<PPtr<SubShaderBinaryData>>();
-                    for (int i = 0; i < numSubShaderBinaryData; i++)
+                    if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
                     {
-                        m_SubShaderBinaryData.Add(new PPtr<SubShaderBinaryData>(reader));
+                        m_EnableShaderLODStreaming = reader.ReadBoolean();
+                        reader.AlignStream();
+                        int numSubShaderBlobs = reader.ReadInt32Clamped(1_000_000);
+                        subShaderBlobs = new List<SubShaderBlob>();
+                        for (int i = 0; i < numSubShaderBlobs; i++)
+                        {
+                            subShaderBlobs.Add(new SubShaderBlob(reader));
+                        }
+                        m_ExternalBlobTailOffset = reader.Position - reader.byteStart;
+                        m_ExternalBlobTailBytes = reader.BytesLeft();
+                        // Endfield uses subShaderBlobs instead of the legacy
+                        // PPtr<SubShaderBinaryData> array. The legacy fields
+                        // remain null deliberately.
+                        m_SubShaderBinaryData = null;
                     }
-                    reader.AlignStream();
-                }
-                platforms = reader.ReadUInt32Array().Select(x => (ShaderCompilerPlatform)x).ToArray();
-                if (reader.Game.Type.IsSRGroup())
-                {
-                    int numPlatformInfos = reader.ReadInt32Clamped(10_000);
-                    platformInfos = new ShaderPlatformInfos[numPlatformInfos];
-
-                    for (int i = 0; i < numPlatformInfos; i++)
+                    platforms = reader.ReadUInt32Array().Select(x => (ShaderCompilerPlatform)x).ToArray();
+                    if (reader.Game.Type.IsSRGroup())
                     {
-                        platformInfos[i] = new ShaderPlatformInfos(reader);
+                        int numPlatformInfos = reader.ReadInt32Clamped(10_000);
+                        platformInfos = new ShaderPlatformInfos[numPlatformInfos];
+
+                        for (int i = 0; i < numPlatformInfos; i++)
+                        {
+                            platformInfos[i] = new ShaderPlatformInfos(reader);
+                        }
                     }
-                }
-                else
-                {
+                    else
+                    {
                     if (version[0] > 2019 || (version[0] == 2019 && version[1] >= 3)) //2019.3 and up
                     {
                         offsets = reader.ReadUInt32ArrayArray();
@@ -1315,31 +1342,36 @@ namespace AnimeStudio
                     {
                         stageCounts = reader.ReadUInt32Array();
                     }
-                }
-
-                if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
-                {
-                    var m_CompressionType = reader.ReadInt32();
-                }
-
-                var m_DependenciesCount = reader.ReadInt32Clamped(1_000_000);
-                for (int i = 0; i < m_DependenciesCount; i++)
-                {
-                    new PPtr<Shader>(reader);
-                }
-
-                if (version[0] >= 2018)
-                {
-                    var m_NonModifiableTexturesCount = reader.ReadInt32Clamped(1_000_000);
-                    for (int i = 0; i < m_NonModifiableTexturesCount; i++)
-                    {
-                        var first = reader.ReadAlignedString();
-                        new PPtr<Texture>(reader);
                     }
-                }
 
-                var m_ShaderIsBaked = reader.ReadBoolean();
-                reader.AlignStream();
+                    if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
+                    {
+                        var m_CompressionType = reader.ReadInt32();
+                    }
+
+                    var m_DependenciesCount = reader.ReadInt32Clamped(1_000_000);
+                    for (int i = 0; i < m_DependenciesCount; i++)
+                    {
+                        new PPtr<Shader>(reader);
+                    }
+
+                    if (version[0] >= 2018)
+                    {
+                        var m_NonModifiableTexturesCount = reader.ReadInt32Clamped(1_000_000);
+                        for (int i = 0; i < m_NonModifiableTexturesCount; i++)
+                        {
+                            var first = reader.ReadAlignedString();
+                            new PPtr<Texture>(reader);
+                        }
+                    }
+
+                    var m_ShaderIsBaked = reader.ReadBoolean();
+                    reader.AlignStream();
+                }
+                catch (System.IO.EndOfStreamException)
+                {
+                    Logger.Warning($"Keeping parsed Shader form; incompatible Endfield shader tail at path {reader.m_PathID}, bytes left {reader.BytesLeft()}.");
+                }
             }
             else
             {
