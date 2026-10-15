@@ -48,6 +48,7 @@ OriginalExportRegression.Run();
 OriginalTextureLuaRegression.Run();
 OriginalResourceRegression.Run();
 VfsBlockRegression.Run();
+VfsIndexV5Regression.Run();
 ShortResourceRegression.Run();
 
 // Optional bounded read-only validation against installed real bank packages.

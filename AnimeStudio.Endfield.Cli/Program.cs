@@ -102,6 +102,8 @@ internal static partial class Program
         catch (Exception ex)
         {
             Console.Error.WriteLine($"Error: {ex.Message}");
+            if (Environment.GetEnvironmentVariable("ENDFIELD_DEBUG") == "1")
+                Console.Error.WriteLine(ex.ToString());
             return 2;
         }
     }

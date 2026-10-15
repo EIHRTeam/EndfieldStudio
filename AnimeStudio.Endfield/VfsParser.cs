@@ -58,16 +58,7 @@ public static class VfsParser
             long chunkLength = ReadI64Le(span, ref cursor);
             BlockType chunkBlockType = BlockTypes.FromByte(ReadU8(span, ref cursor));
 
-            FileTag mainTag;
-            if (codeVersion > 3)
-            {
-                int tagRaw = ReadI32Le(span, ref cursor);
-                mainTag = BlockTypes.FileTagFromByte(unchecked((byte)tagRaw));
-            }
-            else
-            {
-                mainTag = FileTag.None;
-            }
+            FileTag mainTag = ReadFileTag(span, ref cursor, codeVersion);
 
             int fileCount = ReadI32Le(span, ref cursor);
             var files = new List<FileInfo>(fileCount);
@@ -85,16 +76,7 @@ public static class VfsParser
                 bool useEncrypt = ReadU8(span, ref cursor) != 0;
                 long ivSeed = useEncrypt ? ReadI64Le(span, ref cursor) : 0;
 
-                FileTag fileTag;
-                if (codeVersion > 3)
-                {
-                    int tagRaw = ReadI32Le(span, ref cursor);
-                    fileTag = BlockTypes.FileTagFromByte(unchecked((byte)tagRaw));
-                }
-                else
-                {
-                    fileTag = FileTag.None;
-                }
+                FileTag fileTag = ReadFileTag(span, ref cursor, codeVersion);
 
                 files.Add(new FileInfo
                 {
@@ -133,6 +115,23 @@ public static class VfsParser
             Chunks = chunks,
             CodeVersion = codeVersion,
         };
+    }
+
+    /// <summary>
+    /// Chunk/file tag. codeVersion 4 stores an i32; codeVersion 5 (game 1.6.x) widens
+    /// it to 8 bytes (observed values 0 or a constant 64-bit marker) and appends a
+    /// 10-byte trailer (build timestamp) after the chunk list, which is ignored.
+    /// </summary>
+    private static FileTag ReadFileTag(ReadOnlySpan<byte> span, ref int cursor, int codeVersion)
+    {
+        if (codeVersion <= 3) return FileTag.None;
+        if (codeVersion >= 5)
+        {
+            long raw = ReadI64Le(span, ref cursor);
+            return raw == 1 ? FileTag.Audit : FileTag.None;
+        }
+        int tagRaw = ReadI32Le(span, ref cursor);
+        return BlockTypes.FileTagFromByte(unchecked((byte)tagRaw));
     }
 
     private static int ReadI32Le(ReadOnlySpan<byte> span, ref int cursor)
