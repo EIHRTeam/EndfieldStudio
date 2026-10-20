@@ -45,6 +45,7 @@ Console.WriteLine("PASS: PLUG preservation, invalid/truncated/unknown header rej
 NamedAudioRegression.Run();
 OriginalManifestRegression.Run();
 OriginalExportRegression.Run();
+OriginalExportOptionsRegression.Run();
 OriginalTextureLuaRegression.Run();
 OriginalResourceRegression.Run();
 VfsBlockRegression.Run();

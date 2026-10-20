@@ -489,14 +489,15 @@ internal static partial class Program
                         if (info.classID is (int)AS.ClassIDType.Texture2D or (int)AS.ClassIDType.Mesh) run.Fail(identity, exception);
                     }
                     bool failedDecode = decodeError is not null && info.classID is (int)AS.ClassIDType.Texture2D or (int)AS.ClassIDType.Mesh;
+                    // Keep structured details alongside --raw unless metadata already contains them.
+                    string? detailsPath = !run.KeepMetadata && details is not null && info.classID is (int)AS.ClassIDType.Material or (int)AS.ClassIDType.Mesh
+                        ? run.Output.Write(basis + "." + type + ".json", identity, stream => JsonSerializer.Serialize(stream, details, OriginalJson))
+                        : null;
                     if (!run.KeepRaw && !run.KeepMetadata)
                     {
                         // Lean row: everything needed to slice the object back
                         // out of its bundle on demand, plus structured details
                         // (material slots, mesh skin/bind poses) as a sidecar.
-                        string? detailsPath = details is not null && info.classID is (int)AS.ClassIDType.Material or (int)AS.ClassIDType.Mesh
-                            ? run.Output.Write(basis + "." + type + ".json", identity, stream => JsonSerializer.Serialize(stream, details, OriginalJson))
-                            : null;
                         run.Record(new { status = failedDecode ? "decode_error" : decoded is not null || detailsPath is not null ? "exported" : rawOnlyReason is not null ? "raw_only" : "indexed",
                             source = identity, block = source.Block.ToString(), source_path = source.File.FileName, serialized_file = sf.fileName,
                             path_id = info.m_PathID, class_id = info.classID, type, name, original_path = resolved?.Path, path_source = pathKind,
@@ -527,7 +528,7 @@ internal static partial class Program
                         source = identity, block = source.Block.ToString(), source_path = source.File.FileName, serialized_file = sf.fileName,
                         path_id = info.m_PathID, class_id = info.classID, type, name, original_path = resolved?.Path, path_source = pathKind, parent_asset_path = parent,
                         source_offset = info.byteStart, source_size = info.byteSize,
-                        output_path = decoded ?? raw, raw_path = raw, metadata_path = metadataPath, decode_error = decodeError,
+                        output_path = decoded ?? raw, raw_path = raw, metadata_path = metadataPath, details_path = detailsPath, decode_error = decodeError,
                         raw_only_reason = rawOnlyReason });
                     Interlocked.Increment(ref run.Written);
                 }
