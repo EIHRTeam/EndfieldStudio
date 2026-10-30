@@ -992,6 +992,24 @@ internal static partial class Program
         return dir;
     });
 
+    // 同一时刻只允许一个线程做完整压缩 GC：多线程同时强制回收会互相拖慢。
+    private static int CompactGate;
+
+    private static void TryCompactHeap()
+    {
+        if (Interlocked.CompareExchange(ref CompactGate, 1, 0) != 0) return;
+        try
+        {
+            GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref CompactGate, 0);
+        }
+    }
+
     private static void WriteWavViaVgmstream(byte[] wemData, string outPath, string vgmstreamCli)
     {
         string? dir = Path.GetDirectoryName(outPath);
@@ -2504,6 +2522,9 @@ internal static partial class Program
             int effectiveThreads = Math.Max(1, (int)Math.Min(threads,
                 maxMemoryBytes / 2 / Math.Max(1, peakPerBundleHeap)));
 
+            // 周期性回收的水位：托管堆超过这里才做完整 LOH 压缩，避免高频全暂停 GC。
+            long gcWatermarkBytes = Math.Max(4L * 1024 * 1024 * 1024, maxMemoryBytes / 2);
+
             // channel cap：既受内存约束，也受硬上限约束（threads × 4），
             // 避免小 bundle 海洋撑爆 channel → /dev/shm 堆积 + producer 跑太快
             int capByMemory = (int)Math.Min(batch.Count, maxMemoryBytes / 2 / Math.Max(1, maxBundleBytes));
@@ -2761,16 +2782,14 @@ internal static partial class Program
                                 try { File.Delete(bundlePath); } catch { /* ignore */ }
                             }
 
-                            // ── 关键：每 200 个 bundle 强制 LOH 压缩 GC，归还内存给 OS ──
-                            // .NET 默认不压缩 LOH，处理大量 bundle 后 RSS 只涨不降。
-                            // LargeObjectHeapCompactionMode = CompactOnce + Gen2 collect → 真正归还。
+                            // ── 内存水位驱动的 LOH 压缩 ──
+                            // 旧逻辑每 200 个 bundle 无条件做一次阻塞式 Gen2 压缩 GC：27 万个
+                            // bundle 会产生上千次全暂停回收，线程越多堆越大、暂停越久，实测
+                            // 16/32/64 线程的 wall time 反而 274s → 316s → 417s。改为只在托管堆
+                            // 超过水位时回收，并用闸门保证同一时刻只有一个线程做完整压缩。
                             localCount++;
-                            if (localCount % 200 == 0)
-                            {
-                                GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
-                                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
-                                GC.WaitForPendingFinalizers();
-                            }
+                            if (localCount % 200 == 0 && GC.GetTotalMemory(forceFullCollection: false) > gcWatermarkBytes)
+                                TryCompactHeap();
                         }
                     }
                 });
@@ -2784,9 +2803,7 @@ internal static partial class Program
             {
                 try { foreach (var f in Directory.GetFiles(scratch)) File.Delete(f); } catch { }
             }
-            GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
-            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
-            GC.WaitForPendingFinalizers();
+            TryCompactHeap();
 
             if (killSwitch.IsCancellationRequested)
             {

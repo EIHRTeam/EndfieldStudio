@@ -7,6 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>AnimeStudio.Endfield.Cli</RootNamespace>
     <AssemblyName>endfield-dump</AssemblyName>
+    <!-- 吞吐优先：服务端 GC 用每核堆并行回收，批处理解包比工作站 GC 快得多。 -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\AnimeStudio.Endfield\AnimeStudio.Endfield.csproj" />
