@@ -539,6 +539,12 @@ public static class SparkBuffer
                 return br.ReadStringAtOffset();
             case SparkType.Int:
                 return br.ReadInt32LE();
+            case SparkType.Long:
+                // 1.6.x 的热更表出现 Map<string,long>（I18nTextServerTimeIdTable），
+                // 与字段/数组路径一致：按 8 字节对齐读取。
+                return br.ReadAlignedI64();
+            case SparkType.Double:
+                return br.ReadAlignedF64();
             case SparkType.Float:
                 return (double)br.ReadSingleLE();
             case SparkType.Enum:
