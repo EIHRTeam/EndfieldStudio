@@ -53,7 +53,74 @@ internal static class VfsBlockRegression
         catch (TargetInvocationException exception) when (exception.InnerException?.Message == "Not a VFS file / VFS version mismatch")
         { dispatched = true; }
         Check(dispatched, "Identified VFS input must be dispatched to its parser, never silently ignored");
+        ProtectedBlocks();
+
         Console.WriteLine("PASS: high-ratio VFS LZ4, source/node bounds, preallocation budget, truncated input, strict decoding, and explicit VFS dispatch");
+    }
+
+
+    // 1.7.2 起，块索引里 flags 带 0x80 的块会多一个 uint32；数据区是受保护的密文。
+    // 解析时少读这 4 字节会让后续块整体错位（曾表现为 nodesCount too large）。
+    private static void ProtectedBlocks()
+    {
+        uint Cat(ushort hi, ushort lo) => ((uint)hi << 16) | lo;
+        uint RotR32(uint v, int c) => (v >> c) | (v << (32 - c));
+
+        var payload = new List<byte>();
+        // 块记录按大端读（ReadBlocksInfos 只对计数部分临时切到小端），额外字段同样按原端序读。
+        void U16(ushort value) => payload.AddRange(BitConverter.GetBytes(System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(value)));
+        void U32be(uint value) => payload.AddRange(BitConverter.GetBytes(System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(value)));
+
+        const uint blocksCount = 2;
+        // blocksCount = RotR(Cat(lo^hi, lo), 18) ^ 0x91CE0A4F  →  Cat = RotL(count ^ key, 18)
+        uint mixed = blocksCount ^ 0x91CE0A4F;
+        uint catValue = (mixed << 18) | (mixed >> 14);
+        ushort lo = (ushort)catValue;
+        ushort hi = (ushort)((catValue >> 16) ^ lo);
+        uint encCount = ((uint)hi << 16) | lo;
+        uint rawCount = System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(encCount) ^ 0x8A7BF723;
+        payload.AddRange(BitConverter.GetBytes(rawCount));
+
+        // flags = C ^ RotL(flags0, 14) ^ 0x523F，取 a0 = a1 = 0 → flags0 = 0
+        ushort C0 = (ushort)(0x0000 ^ 0x523F);
+        ushort C1 = (ushort)(0x0080 ^ 0x523F);
+        U16(0x1111); U16(0x2222); U16(C0); U16(0x9CD6); U16(0x3333);
+        uint expectedUs0 = RotR32(Cat((ushort)(0x1111 ^ C0 ^ 0xA121), C0), 18) ^ 0xF74324EE;
+        uint expectedCs0 = RotR32(Cat((ushort)(0x2222 ^ 0x3333 ^ 0xA121), 0x3333), 18) ^ 0xF74324EE;
+
+        U16(0x4444); U16(0x5555); U16(C1); U16(0x9CD6); U16(0x6666);
+        uint expectedUs1 = RotR32(Cat((ushort)(0x4444 ^ C1 ^ 0xA121), C1), 18) ^ 0xF74324EE;
+        uint expectedCs1 = RotR32(Cat((ushort)(0x5555 ^ 0x6666 ^ 0xA121), 0x6666), 18) ^ 0xF74324EE;
+        U32be(0xDEADBEEFu);
+
+        using var infoReader = new AS.FileReader("blocks-info", new MemoryStream(payload.ToArray()));
+        infoReader.Endian = AS.EndianType.BigEndian;
+        var blocks = AS.VFSUtils.ReadBlocksInfos(infoReader, AS.GameType.ArknightsEndfield);
+        Check(blocks.Count == 2, "Two blocks must be decoded from the index");
+        Console.WriteLine($"DBG b1 flags={(int)blocks[1].flags} extra={blocks[1].extra} us={blocks[1].uncompressedSize} expUs={expectedUs1} cs={blocks[1].compressedSize} expCs={expectedCs1}");
+        Check((int)blocks[0].flags == 0 && blocks[0].uncompressedSize == expectedUs0
+              && blocks[0].compressedSize == expectedCs0, "Plain block fields must stay byte-exact");
+        Check(((int)blocks[1].flags & 0x80) != 0 && blocks[1].extra == 0xDEADBEEF,
+            "Protected block must consume its trailing uint32 instead of shifting the stream");
+        Check(blocks[1].uncompressedSize == expectedUs1 && blocks[1].compressedSize == expectedCs1,
+            "Protected block sizes must decode exactly like plain blocks");
+
+        var file = (AS.VFSFile)RuntimeHelpers.GetUninitializedObject(typeof(AS.VFSFile));
+        void Field(string name, object value) => typeof(AS.VFSFile).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(file, value);
+        Field("allocationBudget", 1024L * 1024);
+        Field("m_BlocksInfo", new List<AS.BundleFile.StorageBlock> {
+            new() { compressedSize = 8, uncompressedSize = 8, flags = (AS.StorageBlockFlags)0 },
+            new() { compressedSize = 32, uncompressedSize = 4096, flags = (AS.StorageBlockFlags)0x80, extra = 1 },
+        });
+        Field("m_DirectoryInfo", new List<AS.BundleFile.Node> { new() { offset = 0, size = 4104, path = "CAB-fixture" } });
+        Layout(file, 40);
+        var source = new byte[40];
+        Array.Fill(source, (byte)'A', 0, 8);
+        using var output = Decode(file, source);
+        Check(output.Length == 8 + 4096, "Protected blocks must still occupy their declared size");
+        Check(output.ToArray().Take(8).All(b => b == (byte)'A'), "Plain block bytes must be preserved");
+        Check(output.ToArray().Skip(8).All(b => b == 0), "Protected block bytes must be zero-filled");
+        Console.WriteLine("PASS: 0x80 protected blocks (extra uint32 in the index, zero-filled data, correct layout)");
     }
 
     private static void Check(bool condition, string message)

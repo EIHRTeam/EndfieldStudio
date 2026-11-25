@@ -224,11 +224,19 @@ namespace AnimeStudio
                         break;
                 }
 
+                // 1.7.2：flags 带 0x80 的块在索引里多一个 uint32；其数据区是受保护加密块。
+                uint extra = 0;
+                if ((flags & 0x80) != 0)
+                {
+                    extra = reader.ReadUInt32();
+                }
+
                 blocks.Add(new BundleFile.StorageBlock
                 {
                     flags = (StorageBlockFlags)flags,
                     uncompressedSize = uncompressedSize,
                     compressedSize = compressedSize,
+                    extra = extra,
                 });
 
                 Logger.Verbose($"Block {i} Info: {blocks[i]}");

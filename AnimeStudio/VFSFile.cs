@@ -156,9 +156,11 @@ namespace AnimeStudio
             long compressed = 0, uncompressed = 0, largestBuffers = 0, nodes = 0;
             foreach (var block in m_BlocksInfo)
             {
-                if ((int)block.flags is not (0 or 5))
+                // 0x80：受保护块，压缩类型字段不可信，数据区无法离线解码。
+                var blockProtected = ((int)block.flags & 0x80) != 0;
+                if (!blockProtected && (int)block.flags is not (0 or 5))
                     throw new IOException($"Unsupported VFS block compression type {(int)block.flags}");
-                if ((int)block.flags == 0 && block.compressedSize != block.uncompressedSize)
+                if (!blockProtected && (int)block.flags == 0 && block.compressedSize != block.uncompressedSize)
                     throw new IOException("Uncompressed VFS block sizes differ");
                 if (block.compressedSize > int.MaxValue || block.uncompressedSize > int.MaxValue)
                     throw new IOException("VFS block exceeds supported buffer size");
@@ -200,10 +202,36 @@ namespace AnimeStudio
 
         private void ReadBlocks(FileReader reader, Stream blocksStream, GameType game)
         {
+            int protectedBlocks = 0;
             foreach (var blockInfo in m_BlocksInfo)
             {
                 var compressionType = (int)blockInfo.flags; // no mask
                 Logger.Verbose($"Block compression type {compressionType}");
+
+                if ((compressionType & 0x80) != 0)
+                {
+                    // 受保护块：密文占位，按声明大小零填充，保证后续块与节点偏移正确。
+                    // 落在该区间内的对象导出后是空白，属于预期行为。
+                    protectedBlocks++;
+                    var protectedSize = (int)blockInfo.uncompressedSize;
+                    if (protectedSize > 0)
+                    {
+                        var zeros = new byte[Math.Min(protectedSize, 1 << 20)];
+                        int remaining = protectedSize;
+                        while (remaining > 0)
+                        {
+                            int chunk = Math.Min(remaining, zeros.Length);
+                            blocksStream.Write(zeros, 0, chunk);
+                            remaining -= chunk;
+                        }
+                    }
+                    // 密文仍在文件里，必须跨过，否则后续块读取会错位。
+                    if (blockInfo.compressedSize > 0)
+                    {
+                        reader.BaseStream.Seek(blockInfo.compressedSize, SeekOrigin.Current);
+                    }
+                    continue;
+                }
 
                 switch (compressionType)
                 {
@@ -251,6 +279,10 @@ namespace AnimeStudio
                     default:
                         throw new Exception($"Unsupported block compression type {compressionType}");
                 }
+            }
+            if (protectedBlocks > 0)
+            {
+                Logger.Warning($"VFS bundle has {protectedBlocks}/{m_BlocksInfo.Count} protected (0x80) blocks; objects inside them are unavailable");
             }
         }
 

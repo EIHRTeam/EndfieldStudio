@@ -80,6 +80,8 @@ namespace AnimeStudio
             public uint compressedSize;
             public uint uncompressedSize;
             public StorageBlockFlags flags;
+            // 1.7.2 起部分块带 0x80 标记，块索引里额外多一个 uint32；对应数据区受保护，无法离线解码。
+            public uint extra;
 
             public override string ToString()
             {
@@ -87,6 +89,7 @@ namespace AnimeStudio
                 sb.Append($"compressedSize: 0x{compressedSize:X8} | ");
                 sb.Append($"uncompressedSize: 0x{uncompressedSize:X8} | ");
                 sb.Append($"flags: 0x{(int)flags:X8}");
+                if (extra != 0) sb.Append($" | extra: 0x{extra:X8}");
                 return sb.ToString();
             }
         }
